@@ -1,0 +1,73 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Space Grotesk", "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: #030712; /* Deep space/cyber void background */
+  color: #f3f4f6;
+  overflow-x: hidden;
+}
+
+/* Futuristic cyberpunk/cyber-glass UI elements */
+.cyber-card {
+  background: rgba(17, 24, 39, 0.7);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(59, 130, 246, 0.15);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+}
+
+.cyber-card-active {
+  border: 1px solid rgba(59, 130, 246, 0.45);
+  box-shadow: 0 0 15px rgba(59, 130, 246, 0.15);
+}
+
+.cyber-neon-glow {
+  box-shadow: 0 0 20px rgba(59, 130, 246, 0.3);
+}
+
+.cyber-active-gradient {
+  background: linear-gradient(135deg, #1e40af 0%, #3b82f6 50%, #60a5fa 100%);
+}
+
+.cyber-green-gradient {
+  background: linear-gradient(135deg, #064e3b 0%, #10b981 100%);
+}
+
+.cyber-accent-cyan {
+  color: #06b6d4;
+  text-shadow: 0 0 8px rgba(6, 182, 212, 0.4);
+}
+
+.cyber-glow-border {
+  position: relative;
+}
+.cyber-glow-border::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  background: linear-gradient(90deg, #3b82f6, #06b6d4, #10b981);
+  border-radius: inherit;
+  z-index: -1;
+  opacity: 0.3;
+  transition: opacity 0.3s ease;
+}
+.cyber-glow-border:hover::after {
+  opacity: 0.6;
+}
+
+/* Hide scrollbars but keep functionality */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+
