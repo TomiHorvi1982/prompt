@@ -3,6 +3,12 @@ import path from "path";
 import dotenv from "dotenv";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
+import { 
+  localGenerateQuestions, 
+  localSearchCatalog, 
+  localSynthesizePrompt, 
+  localRefinePrompt 
+} from "./src/lib/localModel";
 
 dotenv.config();
 
@@ -27,6 +33,53 @@ function getGeminiClient() {
   });
 }
 
+const CANDIDATE_MODELS = [
+  "gemini-3.6-flash",
+  "gemini-3.1-flash-lite",
+  "gemini-flash-latest"
+];
+
+async function generateContentWithFallback(ai: GoogleGenAI, config: any, allowSearchTool: boolean = true) {
+  let lastError: any = null;
+
+  for (const modelName of CANDIDATE_MODELS) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const reqConfig = { ...config };
+        if (!allowSearchTool && reqConfig.config && reqConfig.config.tools) {
+          delete reqConfig.config.tools;
+        }
+
+        const response = await ai.models.generateContent({
+          ...reqConfig,
+          model: modelName
+        });
+        return response;
+      } catch (err: any) {
+        lastError = err;
+        const status = err?.status || err?.code || "";
+        const msg = (err?.message || "").toLowerCase();
+        
+        const isTransient = status === "UNAVAILABLE" || status === "RESOURCE_EXHAUSTED" || 
+                            status === 503 || status === 429 || status === 500 || status === 502 || status === 504 ||
+                            msg.includes("high demand") || msg.includes("quota") || msg.includes("rate limit") || msg.includes("temporar") || msg.includes("exceeded");
+        
+        if (isTransient) {
+          const delay = attempt * 1000;
+          await new Promise(r => setTimeout(r, delay));
+          if (attempt === 2 && config.config && config.config.tools) {
+            allowSearchTool = false;
+          }
+        } else {
+          break;
+        }
+      }
+    }
+  }
+
+  throw lastError || new Error("All Gemini model candidates exhausted.");
+}
+
 // Endpoint 1: Generate 10-20 detailed context questions
 app.post("/api/generate-questions", async (req, res) => {
   try {
@@ -35,8 +88,9 @@ app.post("/api/generate-questions", async (req, res) => {
       return res.status(400).json({ error: "Original prompt is required" });
     }
 
-    const ai = getGeminiClient();
-    const systemInstruction = `You are a professional Prompt Engineer specialized in optimizing AI prompts for mobile/web apps.
+    try {
+      const ai = getGeminiClient();
+      const systemInstruction = `You are a professional Prompt Engineer specialized in optimizing AI prompts for mobile/web apps.
 Your task is to analyze the user's simple prompt and generate exactly 12 relevant, precise, and interactive questions that will help narrow down the context, target audience, tone, format, constraints, and visual elements.
 Keep the questions short, human-friendly, and highly relevant.
 Also, provide a realistic default example answer for each question to allow fast iteration.
@@ -46,33 +100,38 @@ Return a valid JSON array of objects, where each object has:
 - "question": string
 - "placeholder": string`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: `Generate 12 context questions with default answers for this prompt: "${prompt}"`,
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              id: { type: Type.INTEGER },
-              category: { type: Type.STRING },
-              question: { type: Type.STRING },
-              placeholder: { type: Type.STRING }
-            },
-            required: ["id", "category", "question", "placeholder"]
+      const response = await generateContentWithFallback(ai, {
+        contents: `Generate 12 context questions with default answers for this prompt: "${prompt}"`,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                id: { type: Type.INTEGER },
+                category: { type: Type.STRING },
+                question: { type: Type.STRING },
+                placeholder: { type: Type.STRING }
+              },
+              required: ["id", "category", "question", "placeholder"]
+            }
           }
         }
-      }
-    });
+      });
 
-    const data = JSON.parse(response.text || "[]");
-    res.json({ questions: data });
+      const data = JSON.parse(response.text || "[]");
+      return res.json({ questions: data });
+    } catch (apiError: any) {
+      console.warn("Gemini API unavailable or quota exceeded for questions generation. Using high-performance offline engine:", apiError?.message || apiError);
+      const fallbackQuestions = localGenerateQuestions(prompt);
+      return res.json({ questions: fallbackQuestions, isOfflineFallback: true });
+    }
   } catch (error: any) {
-    console.error("Error generating questions:", error);
-    res.status(500).json({ error: error.message || "Failed to generate context questions." });
+    console.warn("Unexpected error in /api/generate-questions:", error?.message || error);
+    const fallbackQuestions = localGenerateQuestions(req.body?.prompt || "");
+    return res.json({ questions: fallbackQuestions, isOfflineFallback: true });
   }
 });
 
@@ -84,8 +143,9 @@ app.post("/api/search-catalog", async (req, res) => {
       return res.status(400).json({ error: "Original prompt is required" });
     }
 
-    const ai = getGeminiClient();
-    const systemInstruction = `You are an AI prompt analyst.
+    try {
+      const ai = getGeminiClient();
+      const systemInstruction = `You are an AI prompt analyst.
 Your task is to search the web for actual reviewed, high-performing, or industry-standard prompt templates/catalog examples related to the user's topic: "${prompt}".
 Find the 5 most suitable prompts. For each of the 5 items, generate:
 - "title": a short name of the prompt template
@@ -96,42 +156,46 @@ Find the 5 most suitable prompts. For each of the 5 items, generate:
 Make sure the output matches the requested topic perfectly and contains high-quality, practical prompt content.
 Return as a valid JSON array.`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: `Search and find 5 high-quality reviewed prompt catalog templates for: "${prompt}"`,
-      config: {
-        systemInstruction,
-        tools: [{ googleSearch: {} }],
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING },
-              content: { type: Type.STRING },
-              suitability: { type: Type.STRING },
-              source: { type: Type.STRING }
-            },
-            required: ["title", "content", "suitability", "source"]
+      const response = await generateContentWithFallback(ai, {
+        contents: `Search and find 5 high-quality reviewed prompt catalog templates for: "${prompt}"`,
+        config: {
+          systemInstruction,
+          tools: [{ googleSearch: {} }],
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                title: { type: Type.STRING },
+                content: { type: Type.STRING },
+                suitability: { type: Type.STRING },
+                source: { type: Type.STRING }
+              },
+              required: ["title", "content", "suitability", "source"]
+            }
           }
         }
-      }
-    });
+      }, true);
 
-    const catalog = JSON.parse(response.text || "[]");
-    
-    // Extract search citations if available
-    const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-    const citations = chunks.map((c: any) => ({
-      title: c.web?.title || "Prompt Catalog Reference",
-      uri: c.web?.uri || ""
-    })).filter((c: any) => c.uri);
+      const catalog = JSON.parse(response.text || "[]");
+      
+      const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+      const citations = chunks.map((c: any) => ({
+        title: c.web?.title || "Prompt Catalog Reference",
+        uri: c.web?.uri || ""
+      })).filter((c: any) => c.uri);
 
-    res.json({ catalog, citations });
+      return res.json({ catalog, citations });
+    } catch (apiError: any) {
+      console.warn("Gemini API unavailable or quota exceeded for catalog search. Using offline catalog engine:", apiError?.message || apiError);
+      const fallbackCatalog = localSearchCatalog(prompt);
+      return res.json({ catalog: fallbackCatalog, citations: [], isOfflineFallback: true });
+    }
   } catch (error: any) {
-    console.error("Error searching catalog:", error);
-    res.status(500).json({ error: error.message || "Failed to search prompt catalog." });
+    console.warn("Unexpected error in /api/search-catalog:", error?.message || error);
+    const fallbackCatalog = localSearchCatalog(req.body?.prompt || "");
+    return res.json({ catalog: fallbackCatalog, citations: [], isOfflineFallback: true });
   }
 });
 
@@ -140,8 +204,9 @@ app.post("/api/synthesize-prompt", async (req, res) => {
   try {
     const { originalPrompt, answers, selectedCatalogPrompts, referenceAesthetics } = req.body;
     
-    const ai = getGeminiClient();
-    const systemInstruction = `You are a Master Prompt Engineer.
+    try {
+      const ai = getGeminiClient();
+      const systemInstruction = `You are a Master Prompt Engineer.
 Your task is to synthesize a high-performance, robust, and beautiful "Universal Final Prompt" by merging:
 1. The user's original basic idea: "${originalPrompt}"
 2. The extra context from the detailed Q&A answers:
@@ -159,28 +224,43 @@ Provide the response in JSON format with:
 - "finalPrompt": The fully synthesized prompt
 - "explanation": Short, scannable overview of why this prompt was built this way and how it leverages the combined context.`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: "Synthesize the optimized universal prompt based on the provided parameters.",
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            finalPrompt: { type: Type.STRING },
-            explanation: { type: Type.STRING }
-          },
-          required: ["finalPrompt", "explanation"]
+      const response = await generateContentWithFallback(ai, {
+        contents: "Synthesize the optimized universal prompt based on the provided parameters.",
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              finalPrompt: { type: Type.STRING },
+              explanation: { type: Type.STRING }
+            },
+            required: ["finalPrompt", "explanation"]
+          }
         }
-      }
-    });
+      });
 
-    const result = JSON.parse(response.text || "{}");
-    res.json(result);
+      const result = JSON.parse(response.text || "{}");
+      return res.json(result);
+    } catch (apiError: any) {
+      console.warn("Gemini API unavailable or quota exceeded for prompt synthesis. Using offline synthesis engine:", apiError?.message || apiError);
+      const fallbackResult = localSynthesizePrompt(
+        originalPrompt || "",
+        answers || [],
+        selectedCatalogPrompts || [],
+        referenceAesthetics
+      );
+      return res.json({ ...fallbackResult, isOfflineFallback: true });
+    }
   } catch (error: any) {
-    console.error("Error synthesizing prompt:", error);
-    res.status(500).json({ error: error.message || "Failed to synthesize prompt." });
+    console.warn("Unexpected error in /api/synthesize-prompt:", error?.message || error);
+    const fallbackResult = localSynthesizePrompt(
+      req.body?.originalPrompt || "",
+      req.body?.answers || [],
+      req.body?.selectedCatalogPrompts || [],
+      req.body?.referenceAesthetics
+    );
+    return res.json({ ...fallbackResult, isOfflineFallback: true });
   }
 });
 
@@ -189,8 +269,9 @@ app.post("/api/refine-prompt", async (req, res) => {
   try {
     const { finalPrompt, manualEdits } = req.body;
     
-    const ai = getGeminiClient();
-    const systemInstruction = `You are a prompt optimizer.
+    try {
+      const ai = getGeminiClient();
+      const systemInstruction = `You are a prompt optimizer.
 The user has a finalized prompt:
 "${finalPrompt}"
 
@@ -202,28 +283,33 @@ Return the result in JSON format:
 - "finalPrompt": The newly updated, refined, and improved prompt.
 - "explanation": What was changed and why.`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: "Refine and polish the prompt with the specified manual edits.",
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            finalPrompt: { type: Type.STRING },
-            explanation: { type: Type.STRING }
-          },
-          required: ["finalPrompt", "explanation"]
+      const response = await generateContentWithFallback(ai, {
+        contents: "Refine and polish the prompt with the specified manual edits.",
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              finalPrompt: { type: Type.STRING },
+              explanation: { type: Type.STRING }
+            },
+            required: ["finalPrompt", "explanation"]
+          }
         }
-      }
-    });
+      });
 
-    const result = JSON.parse(response.text || "{}");
-    res.json(result);
+      const result = JSON.parse(response.text || "{}");
+      return res.json(result);
+    } catch (apiError: any) {
+      console.warn("Gemini API unavailable or quota exceeded for prompt refinement. Using offline refinement engine:", apiError?.message || apiError);
+      const fallbackResult = localRefinePrompt(finalPrompt || "", manualEdits || "");
+      return res.json({ ...fallbackResult, isOfflineFallback: true });
+    }
   } catch (error: any) {
-    console.error("Error refining prompt:", error);
-    res.status(500).json({ error: error.message || "Failed to refine prompt." });
+    console.warn("Unexpected error in /api/refine-prompt:", error?.message || error);
+    const fallbackResult = localRefinePrompt(req.body?.finalPrompt || "", req.body?.manualEdits || "");
+    return res.json({ ...fallbackResult, isOfflineFallback: true });
   }
 });
 
