@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import posthog from 'posthog-js';
 import { 
   Sparkles, 
   Check, 
@@ -151,7 +152,11 @@ export default function App() {
     setLocalEngines(prev => prev.map(engine => {
       if (engine.id === engineId) {
         if (engine.downloaded || engine.downloading) return engine;
-        
+        posthog.capture('engine_model_downloaded', {
+          engine_id: engineId,
+          engine_name: engine.name,
+          engine_size: engine.size,
+        });
         // Start download simulation
         let currentProg = 0;
         const interval = setInterval(() => {
@@ -182,6 +187,7 @@ export default function App() {
   // Switch between models
   const selectActiveEngine = (engineId: string) => {
     if (engineId === "default-cloud") {
+      posthog.capture('engine_switched', { engine_id: 'default-cloud', engine_name: 'Standard Cloud Core' });
       setActiveEngineId("default-cloud");
       showToast("Aktivován standardní Cloud Engine");
       triggerICloudSync();
@@ -190,6 +196,7 @@ export default function App() {
 
     const engine = localEngines.find(e => e.id === engineId);
     if (engine && engine.downloaded) {
+      posthog.capture('engine_switched', { engine_id: engineId, engine_name: engine.name });
       setActiveEngineId(engineId);
       showToast(`Aktivován model: ${engine.name}`);
       triggerICloudSync();
@@ -368,6 +375,10 @@ export default function App() {
 
   // Apply predictive autocomplete to the prompt
   const applyPrediction = (pred: PredictionCandidate) => {
+    posthog.capture('autocomplete_prediction_applied', {
+      category: pred.category,
+      confidence: pred.confidence,
+    });
     setOriginalPrompt(pred.phrase);
     setPredictions([]);
     showToast(`Autocompleted: ${pred.category}`);
@@ -389,6 +400,13 @@ export default function App() {
       showToast("Please write or select a simple prompt first!");
       return;
     }
+
+    posthog.capture('prompt_optimization_started', {
+      prompt_length: promptToUse.length,
+      word_count: promptToUse.trim().split(/\s+/).filter(Boolean).length,
+      used_starter_template: !!selectedPrompt,
+      mode: offlineMode || !isOnline ? 'offline' : 'cloud',
+    });
 
     setLoadingQuestions(true);
     setLoadingCatalog(true);
@@ -469,6 +487,9 @@ export default function App() {
       answer: q.answer || q.placeholder.replace("e.g., ", "")
     }));
     setQuestions(prefilled);
+    posthog.capture('context_answers_auto_filled', {
+      question_count: questions.length,
+    });
     showToast("AI synthesized context answers!");
     triggerICloudSync();
   };
@@ -534,6 +555,13 @@ export default function App() {
         });
         setSynthesizing(false);
         addOptimizationStep("Syntéza", response.finalPrompt);
+        posthog.capture('prompt_synthesized', {
+          mode: 'offline',
+          engine: engineName,
+          catalog_templates_used: selectedPrompts.length,
+          context_answers_provided: activeAnswers.filter(a => a.answer).length,
+          has_aesthetic: !!referenceAesthetics,
+        });
         showToast(`Zpracováno lokálně modelem: ${engineName}!`);
         triggerICloudSync();
       }, 950);
@@ -553,6 +581,13 @@ export default function App() {
         if (data.error) throw new Error(data.error);
         setSynthesized(data);
         addOptimizationStep("Syntéza", data.finalPrompt);
+        posthog.capture('prompt_synthesized', {
+          mode: data.isOfflineFallback ? 'offline_fallback' : 'cloud',
+          engine: 'default-cloud',
+          catalog_templates_used: selectedPrompts.length,
+          context_answers_provided: activeAnswers.filter(a => a.answer).length,
+          has_aesthetic: !!referenceAesthetics,
+        });
       } catch (err: any) {
         console.warn("Backend synthesis error, falling back to local engine:", err);
         const response = localSynthesizePrompt(
@@ -563,6 +598,13 @@ export default function App() {
         );
         setSynthesized(response);
         addOptimizationStep("Syntéza", response.finalPrompt);
+        posthog.capture('prompt_synthesized', {
+          mode: 'offline_fallback',
+          engine: 'local',
+          catalog_templates_used: selectedPrompts.length,
+          context_answers_provided: activeAnswers.filter(a => a.answer).length,
+          has_aesthetic: !!referenceAesthetics,
+        });
       } finally {
         setSynthesizing(false);
       }
@@ -589,6 +631,10 @@ export default function App() {
         setRefining(false);
         addOptimizationStep(label, response.finalPrompt);
         setManualEdits("");
+        posthog.capture('prompt_refined', {
+          mode: 'offline',
+          refinement_step: optimizationHistory.length,
+        });
         showToast("Re-compiled & polished offline");
         triggerICloudSync();
       }, 850);
@@ -607,6 +653,10 @@ export default function App() {
         setSynthesized(data);
         addOptimizationStep(label, data.finalPrompt);
         setManualEdits("");
+        posthog.capture('prompt_refined', {
+          mode: data.isOfflineFallback ? 'offline_fallback' : 'cloud',
+          refinement_step: optimizationHistory.length,
+        });
         showToast("Reprocessed manual directives!");
       } catch (err: any) {
         console.warn("Backend refinement failed, using offline compiler:", err);
@@ -614,6 +664,10 @@ export default function App() {
         setSynthesized(response);
         addOptimizationStep(label, response.finalPrompt);
         setManualEdits("");
+        posthog.capture('prompt_refined', {
+          mode: 'offline_fallback',
+          refinement_step: optimizationHistory.length,
+        });
       } finally {
         setRefining(false);
       }
@@ -635,12 +689,18 @@ export default function App() {
 
     setSavedSessions(prev => [newSession, ...prev]);
     setActiveSessionId(newSession.id);
+    posthog.capture('prompt_saved', {
+      optimization_steps: optimizationHistory.length,
+    });
     showToast("Backed up to iCloud Storage");
     triggerICloudSync();
   };
 
   // Load a historic session
   const handleLoadSession = (sess: SavedPromptSession) => {
+    posthog.capture('prompt_session_loaded', {
+      had_optimization_history: !!(sess.optimizationHistory && sess.optimizationHistory.length > 0),
+    });
     setOriginalPrompt(sess.originalPrompt);
     setSynthesized({
       finalPrompt: sess.finalPrompt,
@@ -679,6 +739,7 @@ export default function App() {
   // Delete an iCloud session
   const handleDeleteSession = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    posthog.capture('prompt_session_deleted');
     setSavedSessions(prev => prev.filter(s => s.id !== id));
     if (activeSessionId === id) {
       setActiveSessionId(null);
@@ -689,6 +750,10 @@ export default function App() {
 
   // Apply visual preset style
   const handleApplyPreset = (preset: any) => {
+    posthog.capture('aesthetic_preset_applied', {
+      preset_id: preset.id,
+      preset_name: preset.name,
+    });
     setSelectedPresetId(preset.id);
     setReferenceAesthetics(`${preset.name} - ${preset.description}`);
     setShowAestheticModal(false);
@@ -703,6 +768,9 @@ export default function App() {
       setCopiedIndex(index);
       setTimeout(() => setCopiedIndex(null), 2000);
     } else {
+      posthog.capture('prompt_copied', {
+        prompt_length: text.length,
+      });
       setCopiedFinal(true);
       setTimeout(() => setCopiedFinal(false), 2000);
     }
@@ -1022,7 +1090,10 @@ export default function App() {
                 {/* Toggle Deep Prompt Analysis */}
                 <button
                   type="button"
-                  onClick={() => setShowDeepAnalysis(!showDeepAnalysis)}
+                  onClick={() => {
+                    posthog.capture('deep_analysis_toggled', { action: showDeepAnalysis ? 'hide' : 'show' });
+                    setShowDeepAnalysis(!showDeepAnalysis);
+                  }}
                   disabled={!originalPrompt.trim()}
                   className={`py-3 px-4 rounded-2xl font-bold text-sm transition-all active:scale-98 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed border ${
                     showDeepAnalysis 
@@ -1180,6 +1251,9 @@ export default function App() {
                             <button
                               key={idx}
                               onClick={() => {
+                                posthog.capture('starter_template_selected', {
+                                  template_label: tmpl.label,
+                                });
                                 setOriginalPrompt(tmpl.prompt);
                                 handleStartPrompt(tmpl.prompt);
                               }}
