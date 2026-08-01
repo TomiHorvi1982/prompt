@@ -1,5 +1,4 @@
-import React, { useState, useEffect } from "react";
-import posthog from 'posthog-js';
+import React, { useState, useEffect, useMemo } from "react";
 import { 
   Sparkles, 
   Check, 
@@ -30,7 +29,13 @@ import {
   Zap,
   ChevronDown,
   ChevronUp,
-  BarChart3
+  BarChart3,
+  Gauge,
+  Download,
+  FileCode,
+  Mic,
+  MicOff,
+  Volume2
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
@@ -63,6 +68,9 @@ export default function App() {
 
   // App core variables
   const [originalPrompt, setOriginalPrompt] = useState("");
+  const liveComplexity = useMemo(() => calculateComplexity(originalPrompt), [originalPrompt]);
+  const liveWordCount = useMemo(() => originalPrompt.trim().split(/\s+/).filter(Boolean).length, [originalPrompt]);
+  const liveCharCount = originalPrompt.length;
   const [currentPillar, setCurrentPillar] = useState<1 | 2 | 3>(1);
 
   // Pillar 1: Context Questions
@@ -100,6 +108,7 @@ export default function App() {
   const [isICloudSavedOpen, setIsICloudSavedOpen] = useState(false);
   const [isModelSelectorOpen, setIsModelSelectorOpen] = useState(false);
   const [showDeepAnalysis, setShowDeepAnalysis] = useState(false);
+  const [showExportMenu, setShowExportMenu] = useState(false);
 
   // Local Neural Core / Models list state
   const [localEngines, setLocalEngines] = useState<LocalEngine[]>([
@@ -152,11 +161,7 @@ export default function App() {
     setLocalEngines(prev => prev.map(engine => {
       if (engine.id === engineId) {
         if (engine.downloaded || engine.downloading) return engine;
-        posthog.capture('engine_model_downloaded', {
-          engine_id: engineId,
-          engine_name: engine.name,
-          engine_size: engine.size,
-        });
+        
         // Start download simulation
         let currentProg = 0;
         const interval = setInterval(() => {
@@ -187,7 +192,6 @@ export default function App() {
   // Switch between models
   const selectActiveEngine = (engineId: string) => {
     if (engineId === "default-cloud") {
-      posthog.capture('engine_switched', { engine_id: 'default-cloud', engine_name: 'Standard Cloud Core' });
       setActiveEngineId("default-cloud");
       showToast("Aktivován standardní Cloud Engine");
       triggerICloudSync();
@@ -196,7 +200,6 @@ export default function App() {
 
     const engine = localEngines.find(e => e.id === engineId);
     if (engine && engine.downloaded) {
-      posthog.capture('engine_switched', { engine_id: engineId, engine_name: engine.name });
       setActiveEngineId(engineId);
       showToast(`Aktivován model: ${engine.name}`);
       triggerICloudSync();
@@ -210,6 +213,79 @@ export default function App() {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [copiedFinal, setCopiedFinal] = useState(false);
+
+  // Web Speech API Voice-to-Text state
+  const [isListening, setIsListening] = useState(false);
+  const recognitionRef = React.useRef<any>(null);
+
+  const toggleListening = () => {
+    const windowObj = window as any;
+    const SpeechRecognition = windowObj.SpeechRecognition || windowObj.webkitSpeechRecognition;
+
+    if (!SpeechRecognition) {
+      showToast("Váš prohlížeč nepodporuje rozpoznávání hlasu (Web Speech API).");
+      return;
+    }
+
+    if (isListening) {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch {
+          // ignore
+        }
+      }
+      setIsListening(false);
+      showToast("Hlasové zadávání pozastaveno.");
+      return;
+    }
+
+    try {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = navigator.language || "cs-CZ";
+
+      let baseText = originalPrompt;
+
+      recognition.onstart = () => {
+        setIsListening(true);
+        showToast("Hlasové nahrávání aktivní — mluvte...");
+      };
+
+      recognition.onresult = (event: any) => {
+        let transcript = "";
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          transcript += event.results[i][0].transcript;
+        }
+        if (transcript) {
+          const spacing = baseText && !baseText.endsWith(" ") ? " " : "";
+          setOriginalPrompt(baseText + spacing + transcript);
+        }
+      };
+
+      recognition.onerror = (event: any) => {
+        console.warn("Speech recognition error:", event.error);
+        if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+          showToast("Přístup k mikrofonu byl odmítnut.");
+        } else if (event.error !== "no-speech") {
+          showToast(`Chyba hlasového vstupu: ${event.error}`);
+        }
+        setIsListening(false);
+      };
+
+      recognition.onend = () => {
+        setIsListening(false);
+      };
+
+      recognitionRef.current = recognition;
+      recognition.start();
+    } catch (err: any) {
+      console.error("Failed to start speech recognition:", err);
+      showToast("Chyba při spuštění rozpoznávání hlasu.");
+      setIsListening(false);
+    }
+  };
 
   // Live System Clock
   const [currentTime, setCurrentTime] = useState("");
@@ -375,10 +451,6 @@ export default function App() {
 
   // Apply predictive autocomplete to the prompt
   const applyPrediction = (pred: PredictionCandidate) => {
-    posthog.capture('autocomplete_prediction_applied', {
-      category: pred.category,
-      confidence: pred.confidence,
-    });
     setOriginalPrompt(pred.phrase);
     setPredictions([]);
     showToast(`Autocompleted: ${pred.category}`);
@@ -400,13 +472,6 @@ export default function App() {
       showToast("Please write or select a simple prompt first!");
       return;
     }
-
-    posthog.capture('prompt_optimization_started', {
-      prompt_length: promptToUse.length,
-      word_count: promptToUse.trim().split(/\s+/).filter(Boolean).length,
-      used_starter_template: !!selectedPrompt,
-      mode: offlineMode || !isOnline ? 'offline' : 'cloud',
-    });
 
     setLoadingQuestions(true);
     setLoadingCatalog(true);
@@ -487,9 +552,6 @@ export default function App() {
       answer: q.answer || q.placeholder.replace("e.g., ", "")
     }));
     setQuestions(prefilled);
-    posthog.capture('context_answers_auto_filled', {
-      question_count: questions.length,
-    });
     showToast("AI synthesized context answers!");
     triggerICloudSync();
   };
@@ -555,13 +617,6 @@ export default function App() {
         });
         setSynthesizing(false);
         addOptimizationStep("Syntéza", response.finalPrompt);
-        posthog.capture('prompt_synthesized', {
-          mode: 'offline',
-          engine: engineName,
-          catalog_templates_used: selectedPrompts.length,
-          context_answers_provided: activeAnswers.filter(a => a.answer).length,
-          has_aesthetic: !!referenceAesthetics,
-        });
         showToast(`Zpracováno lokálně modelem: ${engineName}!`);
         triggerICloudSync();
       }, 950);
@@ -581,13 +636,6 @@ export default function App() {
         if (data.error) throw new Error(data.error);
         setSynthesized(data);
         addOptimizationStep("Syntéza", data.finalPrompt);
-        posthog.capture('prompt_synthesized', {
-          mode: data.isOfflineFallback ? 'offline_fallback' : 'cloud',
-          engine: 'default-cloud',
-          catalog_templates_used: selectedPrompts.length,
-          context_answers_provided: activeAnswers.filter(a => a.answer).length,
-          has_aesthetic: !!referenceAesthetics,
-        });
       } catch (err: any) {
         console.warn("Backend synthesis error, falling back to local engine:", err);
         const response = localSynthesizePrompt(
@@ -598,13 +646,6 @@ export default function App() {
         );
         setSynthesized(response);
         addOptimizationStep("Syntéza", response.finalPrompt);
-        posthog.capture('prompt_synthesized', {
-          mode: 'offline_fallback',
-          engine: 'local',
-          catalog_templates_used: selectedPrompts.length,
-          context_answers_provided: activeAnswers.filter(a => a.answer).length,
-          has_aesthetic: !!referenceAesthetics,
-        });
       } finally {
         setSynthesizing(false);
       }
@@ -631,10 +672,6 @@ export default function App() {
         setRefining(false);
         addOptimizationStep(label, response.finalPrompt);
         setManualEdits("");
-        posthog.capture('prompt_refined', {
-          mode: 'offline',
-          refinement_step: optimizationHistory.length,
-        });
         showToast("Re-compiled & polished offline");
         triggerICloudSync();
       }, 850);
@@ -653,10 +690,6 @@ export default function App() {
         setSynthesized(data);
         addOptimizationStep(label, data.finalPrompt);
         setManualEdits("");
-        posthog.capture('prompt_refined', {
-          mode: data.isOfflineFallback ? 'offline_fallback' : 'cloud',
-          refinement_step: optimizationHistory.length,
-        });
         showToast("Reprocessed manual directives!");
       } catch (err: any) {
         console.warn("Backend refinement failed, using offline compiler:", err);
@@ -664,14 +697,49 @@ export default function App() {
         setSynthesized(response);
         addOptimizationStep(label, response.finalPrompt);
         setManualEdits("");
-        posthog.capture('prompt_refined', {
-          mode: 'offline_fallback',
-          refinement_step: optimizationHistory.length,
-        });
       } finally {
         setRefining(false);
       }
     }
+  };
+
+  // Restore a previous version of prompt directly from history
+  const handleRestoreStep = (step: OptimizationStep) => {
+    const restoredPrompt = step.prompt;
+    setSynthesized({
+      finalPrompt: restoredPrompt,
+      explanation: `Obnovená verze z historie optimalizace (Krok #${step.stepIndex}: "${step.label}")`
+    });
+    const shortLabel = step.label.length > 15 ? step.label.substring(0, 15) + "..." : step.label;
+    const newLabel = `Obnovení #${step.stepIndex} ("${shortLabel}")`;
+    addOptimizationStep(newLabel, restoredPrompt);
+    showToast(`Obnovena verze promptu z kroku #${step.stepIndex}!`);
+    triggerICloudSync();
+  };
+
+  // Export final synthesized prompt as .txt or .md file
+  const handleExportPrompt = (format: "txt" | "md") => {
+    if (!synthesized?.finalPrompt) return;
+    
+    let content = synthesized.finalPrompt;
+    let filename = `synthesized-prompt.${format}`;
+    let mimeType = format === "md" ? "text/markdown;charset=utf-8;" : "text/plain;charset=utf-8;";
+
+    if (format === "md") {
+      content = `# Universal Synthesized Prompt\n\n> **Architect Tuning Notes:** ${synthesized.explanation || 'Synthesized via Neural Matrix'}\n\n\`\`\`markdown\n${synthesized.finalPrompt}\n\`\`\`\n`;
+    }
+
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    showToast(`Exportováno jako ${filename}`);
   };
 
   // Save synthesized prompt to iCloud storage log
@@ -689,18 +757,12 @@ export default function App() {
 
     setSavedSessions(prev => [newSession, ...prev]);
     setActiveSessionId(newSession.id);
-    posthog.capture('prompt_saved', {
-      optimization_steps: optimizationHistory.length,
-    });
     showToast("Backed up to iCloud Storage");
     triggerICloudSync();
   };
 
   // Load a historic session
   const handleLoadSession = (sess: SavedPromptSession) => {
-    posthog.capture('prompt_session_loaded', {
-      had_optimization_history: !!(sess.optimizationHistory && sess.optimizationHistory.length > 0),
-    });
     setOriginalPrompt(sess.originalPrompt);
     setSynthesized({
       finalPrompt: sess.finalPrompt,
@@ -739,7 +801,6 @@ export default function App() {
   // Delete an iCloud session
   const handleDeleteSession = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    posthog.capture('prompt_session_deleted');
     setSavedSessions(prev => prev.filter(s => s.id !== id));
     if (activeSessionId === id) {
       setActiveSessionId(null);
@@ -750,10 +811,6 @@ export default function App() {
 
   // Apply visual preset style
   const handleApplyPreset = (preset: any) => {
-    posthog.capture('aesthetic_preset_applied', {
-      preset_id: preset.id,
-      preset_name: preset.name,
-    });
     setSelectedPresetId(preset.id);
     setReferenceAesthetics(`${preset.name} - ${preset.description}`);
     setShowAestheticModal(false);
@@ -768,9 +825,6 @@ export default function App() {
       setCopiedIndex(index);
       setTimeout(() => setCopiedIndex(null), 2000);
     } else {
-      posthog.capture('prompt_copied', {
-        prompt_length: text.length,
-      });
       setCopiedFinal(true);
       setTimeout(() => setCopiedFinal(false), 2000);
     }
@@ -872,28 +926,49 @@ export default function App() {
         <div className="px-4 pb-20 pt-2 h-[calc(100%-48px)] overflow-y-auto no-scrollbar flex flex-col justify-between">
           
           <div>
-            {/* futuristic Header Branding */}
+            {/* Header Branding */}
             <div className="mt-2 mb-4 px-1 flex items-center justify-between">
               <div>
-                <span className="text-[10px] font-bold text-cyan-400 tracking-widest uppercase flex items-center gap-1 font-mono">
-                  <Zap className="w-3 h-3 text-cyan-400" />
-                  Future AI Architect Grid
-                </span>
-                <h1 className="text-2xl font-bold tracking-tight text-white mt-0.5 flex items-center gap-2">
+                <h1 className="text-2xl font-bold tracking-tight text-white mt-0.5">
                   Prompt Architect
-                  <Sparkles className="w-5 h-5 text-cyan-400 fill-cyan-400/10" />
                 </h1>
               </div>
-              <span className="text-[11px] bg-slate-900 text-cyan-400 font-mono font-bold px-2.5 py-0.5 rounded-md border border-slate-800">
-                PRO_v2.0
-              </span>
             </div>
 
             {/* PILLAR STEP 0: Base Input Entry Point */}
-            <div className="cyber-card rounded-3xl p-4 mb-4 relative border-slate-800 bg-[#0d1527]/70">
-              <label className="block text-[10px] font-bold text-cyan-400 uppercase tracking-widest mb-2 font-mono">
-                1. Input Core Directive
-              </label>
+            <div className="cyber-card rounded-3xl p-4 mb-4 relative border-slate-800 bg-[#0d1527]/70" id="input-core-directive-panel">
+              <div className="flex items-center justify-between mb-2.5 flex-wrap gap-2">
+                <label className="block text-[10px] font-bold text-cyan-400 uppercase tracking-widest font-mono">
+                  1. Input Core Directive
+                </label>
+
+                {/* Real-Time Complexity Gauge Badge */}
+                <div className="flex items-center gap-2 font-mono" id="complexity-gauge-badge">
+                  <div className="flex items-center gap-1 text-[10px] text-slate-400 font-semibold">
+                    <Gauge className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>Komplexita:</span>
+                  </div>
+                  <div className="flex items-center gap-1.5 bg-slate-950/90 border border-slate-800/80 px-2.5 py-1 rounded-xl shadow-xs">
+                    <div className="w-16 h-1.5 bg-slate-900 rounded-full overflow-hidden border border-slate-800/60">
+                      <div 
+                        className={`h-full transition-all duration-300 rounded-full ${
+                          liveComplexity > 65
+                            ? "bg-gradient-to-r from-cyan-400 via-teal-400 to-emerald-400 shadow-sm shadow-emerald-500/50"
+                            : liveComplexity > 35
+                            ? "bg-gradient-to-r from-cyan-500 to-blue-500"
+                            : "bg-gradient-to-r from-amber-500 to-cyan-500"
+                        }`}
+                        style={{ width: `${liveComplexity}%` }}
+                      />
+                    </div>
+                    <span className={`text-[10px] font-bold ${
+                      liveComplexity > 65 ? "text-emerald-400" : liveComplexity > 35 ? "text-cyan-400" : "text-amber-400"
+                    }`}>
+                      {liveComplexity}%
+                    </span>
+                  </div>
+                </div>
+              </div>
               
               <div className="relative">
                 {/* Background overlay for Ghost Auto-completion suggestion (Gmail style) */}
@@ -909,18 +984,89 @@ export default function App() {
                   onChange={(e) => setOriginalPrompt(e.target.value)}
                   onKeyDown={handlePromptKeyDown}
                   placeholder="e.g. Vytvořit moderní SwiftUI, Create a high-converting SaaS..."
-                  className="w-full text-sm bg-slate-950/80 border border-slate-800 rounded-2xl p-3.5 pr-10 focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-hidden min-h-[85px] resize-none font-medium text-slate-100 placeholder-slate-500 relative z-10 bg-transparent"
+                  className="w-full text-sm bg-slate-950/80 border border-slate-800 rounded-2xl p-3.5 pr-20 focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-hidden min-h-[85px] resize-none font-medium text-slate-100 placeholder-slate-500 relative z-10 bg-transparent"
                 />
                 
-                {/* Floating Plus Button inside input container */}
-                <button
-                  type="button"
-                  onClick={() => setShowAestheticModal(true)}
-                  className="absolute right-2 bottom-3 p-1.5 rounded-full bg-slate-900 border border-slate-800 text-slate-400 hover:text-cyan-400 hover:border-cyan-500/50 shadow-md active:scale-90 transition-all flex items-center justify-center z-20"
-                  title="Inject Visual Appearance Reference Preset"
-                >
-                  <Plus className="w-4 h-4" />
-                </button>
+                {/* Floating Action Buttons inside input container */}
+                <div className="absolute right-2 bottom-3 flex items-center gap-1.5 z-20">
+                  {/* Voice-to-text Mic button */}
+                  <button
+                    type="button"
+                    onClick={toggleListening}
+                    id="voice-input-btn"
+                    className={`p-1.5 rounded-full border shadow-md active:scale-90 transition-all flex items-center justify-center cursor-pointer ${
+                      isListening
+                        ? "bg-rose-950/90 border-rose-500/80 text-rose-400 animate-pulse shadow-rose-500/30"
+                        : "bg-slate-900 border-slate-800 text-slate-400 hover:text-cyan-400 hover:border-cyan-500/50"
+                    }`}
+                    title={isListening ? "Zastavit hlasový vstup" : "Aktivovat hlasové zadávání (Voice-to-Text)"}
+                  >
+                    {isListening ? (
+                      <MicOff className="w-4 h-4 text-rose-400" />
+                    ) : (
+                      <Mic className="w-4 h-4" />
+                    )}
+                  </button>
+
+                  {/* Preset Injector Button */}
+                  <button
+                    type="button"
+                    onClick={() => setShowAestheticModal(true)}
+                    className="p-1.5 rounded-full bg-slate-900 border border-slate-800 text-slate-400 hover:text-cyan-400 hover:border-cyan-500/50 shadow-md active:scale-90 transition-all flex items-center justify-center cursor-pointer"
+                    title="Inject Visual Appearance Reference Preset"
+                  >
+                    <Plus className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Active Speech Recording Status Indicator */}
+              {isListening && (
+                <div className="mt-2 px-3 py-1.5 rounded-xl bg-rose-950/60 border border-rose-500/40 flex items-center justify-between text-rose-300 text-[10px] font-mono animate-pulse" id="voice-recording-status">
+                  <div className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-rose-500 animate-ping"></span>
+                    <span className="font-bold">Mluvte nyní... Hlas je převáděn na text v reálném čase</span>
+                  </div>
+                  <button 
+                    type="button" 
+                    onClick={toggleListening}
+                    className="text-[9px] underline hover:text-rose-200 cursor-pointer"
+                  >
+                    Zastavit
+                  </button>
+                </div>
+              )}
+
+              {/* Real-time Structural Richness Gauge Details Strip */}
+              <div className="mt-2 bg-slate-950/60 border border-slate-900 rounded-xl p-2 flex items-center justify-between text-[10px] font-mono flex-wrap gap-1.5" id="complexity-gauge-details-strip">
+                <div className="flex items-center gap-2.5">
+                  <span className="text-slate-400 font-semibold flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-cyan-400"></span>
+                    {liveWordCount} {liveWordCount === 1 ? 'slovo' : liveWordCount >= 2 && liveWordCount <= 4 ? 'slova' : 'slov'} ({liveCharCount} znaků)
+                  </span>
+                  <span className="text-slate-700">|</span>
+                  <span className="text-slate-300 font-medium">
+                    {liveComplexity === 0 ? (
+                      <span className="text-slate-500 italic">Zadejte instrukci pro výpočet...</span>
+                    ) : liveComplexity > 75 ? (
+                      <span className="text-emerald-400 font-bold flex items-center gap-1">
+                        <Sparkles className="w-3 h-3" /> Vysoce strukturovaný prompt
+                      </span>
+                    ) : liveComplexity > 50 ? (
+                      <span className="text-cyan-400 font-semibold">⚡ Detailní zadání</span>
+                    ) : liveComplexity > 25 ? (
+                      <span className="text-blue-400 font-medium">📝 Standardní formulace</span>
+                    ) : (
+                      <span className="text-amber-400 font-medium">🌱 Základní koncept</span>
+                    )}
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-1 text-[9px] text-slate-500 font-mono">
+                  <span className={`px-1.5 py-0.5 rounded border transition-colors ${originalPrompt.includes('#') ? 'bg-cyan-950/80 text-cyan-300 border-cyan-800/50 font-bold' : 'bg-slate-900/60 border-slate-850'}`}># Nadpisy</span>
+                  <span className={`px-1.5 py-0.5 rounded border transition-colors ${/[-*+]\s/.test(originalPrompt) ? 'bg-cyan-950/80 text-cyan-300 border-cyan-800/50 font-bold' : 'bg-slate-900/60 border-slate-850'}`}>• Seznamy</span>
+                  <span className={`px-1.5 py-0.5 rounded border transition-colors ${/\{\{.*?\}\}|\[.*?\]/.test(originalPrompt) ? 'bg-cyan-950/80 text-cyan-300 border-cyan-800/50 font-bold' : 'bg-slate-900/60 border-slate-850'}`}>&#123;&#123;Proměnná&#125;&#125;</span>
+                </div>
               </div>
 
               {/* Suggestions Overlay */}
@@ -1090,10 +1236,7 @@ export default function App() {
                 {/* Toggle Deep Prompt Analysis */}
                 <button
                   type="button"
-                  onClick={() => {
-                    posthog.capture('deep_analysis_toggled', { action: showDeepAnalysis ? 'hide' : 'show' });
-                    setShowDeepAnalysis(!showDeepAnalysis);
-                  }}
+                  onClick={() => setShowDeepAnalysis(!showDeepAnalysis)}
                   disabled={!originalPrompt.trim()}
                   className={`py-3 px-4 rounded-2xl font-bold text-sm transition-all active:scale-98 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed border ${
                     showDeepAnalysis 
@@ -1133,9 +1276,6 @@ export default function App() {
                   <h3 className="text-xs font-bold text-slate-200 uppercase font-mono tracking-wider">
                     Inteligentní nápověda & Predikce textu
                   </h3>
-                  <span className="text-[9px] text-slate-500 font-sans block">
-                    Kontextový našeptávač s neuronovou analýzou vět
-                  </span>
                 </div>
               </div>
 
@@ -1251,9 +1391,6 @@ export default function App() {
                             <button
                               key={idx}
                               onClick={() => {
-                                posthog.capture('starter_template_selected', {
-                                  template_label: tmpl.label,
-                                });
                                 setOriginalPrompt(tmpl.prompt);
                                 handleStartPrompt(tmpl.prompt);
                               }}
@@ -1526,18 +1663,46 @@ export default function App() {
                   exit={{ opacity: 0, y: -10 }}
                   className="space-y-3"
                 >
-                  <div className="px-1 flex items-center justify-between">
+                  <div className="px-1 flex items-center justify-between flex-wrap gap-2">
                     <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest font-mono">
                       Universal Final Prompt Matrix
                     </h3>
                     
-                    <button
-                      onClick={handleSaveToICloud}
-                      className="text-[10px] font-bold text-slate-300 bg-slate-900 border border-slate-800 rounded-full px-3 py-1 flex items-center gap-1.5 hover:bg-slate-850 hover:text-cyan-400 transition-colors cursor-pointer shadow-md font-mono"
-                    >
-                      <CloudCheck className="w-3.5 h-3.5 text-cyan-400" />
-                      iCloud Backup
-                    </button>
+                    <div className="flex items-center gap-2">
+                      {/* Direct Header Export Buttons */}
+                      {synthesized && (
+                        <div className="flex items-center bg-slate-900 border border-slate-800 rounded-full p-0.5 shadow-md font-mono" id="matrix-header-export-group">
+                          <button
+                            type="button"
+                            onClick={() => handleExportPrompt("txt")}
+                            id="export-txt-header-btn"
+                            className="text-[10px] font-bold text-slate-300 hover:text-cyan-400 px-2.5 py-1 rounded-full hover:bg-slate-800 transition-colors flex items-center gap-1 cursor-pointer"
+                            title="Exportovat jako prostý text (.txt)"
+                          >
+                            <Download className="w-3 h-3 text-cyan-400" />
+                            <span>.TXT</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleExportPrompt("md")}
+                            id="export-md-header-btn"
+                            className="text-[10px] font-bold text-slate-300 hover:text-cyan-400 px-2.5 py-1 rounded-full hover:bg-slate-800 transition-colors flex items-center gap-1 cursor-pointer"
+                            title="Exportovat jako Markdown (.md)"
+                          >
+                            <FileCode className="w-3 h-3 text-cyan-400" />
+                            <span>.MD</span>
+                          </button>
+                        </div>
+                      )}
+
+                      <button
+                        onClick={handleSaveToICloud}
+                        className="text-[10px] font-bold text-slate-300 bg-slate-900 border border-slate-800 rounded-full px-3 py-1 flex items-center gap-1.5 hover:bg-slate-850 hover:text-cyan-400 transition-colors cursor-pointer shadow-md font-mono"
+                      >
+                        <CloudCheck className="w-3.5 h-3.5 text-cyan-400" />
+                        iCloud Backup
+                      </button>
+                    </div>
                   </div>
 
                   {synthesizing ? (
@@ -1554,27 +1719,74 @@ export default function App() {
                         <textarea
                           readOnly
                           value={synthesized.finalPrompt}
-                          className="w-full text-[11px] font-mono text-slate-300 bg-slate-900/40 border border-slate-800/80 rounded-xl p-3 min-h-[220px] focus:outline-hidden resize-y leading-relaxed"
+                          className="w-full text-[11px] font-mono text-slate-300 bg-slate-900/40 border border-slate-800/80 rounded-xl p-3 pt-12 min-h-[220px] focus:outline-hidden resize-y leading-relaxed"
                         />
                         
-                        {/* Copy button */}
-                        <button
-                          type="button"
-                          onClick={() => handleCopyText(synthesized.finalPrompt)}
-                          className="absolute right-5 top-5 p-2 bg-slate-900 rounded-lg shadow-md border border-slate-800 text-slate-300 hover:text-cyan-400 transition-colors flex items-center gap-1 text-[10px] font-bold font-mono"
-                        >
-                          {copiedFinal ? (
-                            <>
-                              <Check className="w-3.5 h-3.5 text-emerald-400" />
-                              <span className="text-emerald-400">COPIED</span>
-                            </>
-                          ) : (
-                            <>
-                              <Copy className="w-3.5 h-3.5" />
-                              <span>COPY FINAL</span>
-                            </>
-                          )}
-                        </button>
+                        {/* Terminal Controls Bar (Copy & Export) */}
+                        <div className="absolute right-5 top-5 flex items-center gap-2">
+                          {/* Export Dropdown Menu */}
+                          <div className="relative" id="terminal-export-dropdown">
+                            <button
+                              type="button"
+                              onClick={() => setShowExportMenu(!showExportMenu)}
+                              id="terminal-export-btn"
+                              className="p-2 bg-slate-900 hover:bg-slate-850 rounded-lg shadow-md border border-slate-800 text-slate-300 hover:text-cyan-400 transition-colors flex items-center gap-1.5 text-[10px] font-bold font-mono cursor-pointer"
+                              title="Exportovat prompt do souboru"
+                            >
+                              <Download className="w-3.5 h-3.5 text-cyan-400" />
+                              <span>EXPORT</span>
+                              <ChevronDown className={`w-3 h-3 transition-transform ${showExportMenu ? "rotate-180" : ""}`} />
+                            </button>
+
+                            {showExportMenu && (
+                              <div className="absolute right-0 mt-1.5 w-36 bg-slate-900 border border-slate-800 rounded-xl shadow-2xl p-1 z-30 space-y-0.5 animate-in fade-in zoom-in-95">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    handleExportPrompt("txt");
+                                    setShowExportMenu(false);
+                                  }}
+                                  id="export-opt-txt"
+                                  className="w-full text-left px-2.5 py-1.5 rounded-lg text-[10px] font-mono font-semibold text-slate-200 hover:bg-slate-800 hover:text-cyan-400 flex items-center gap-2 cursor-pointer transition-colors"
+                                >
+                                  <FileText className="w-3.5 h-3.5 text-cyan-400" />
+                                  <span>Text (.txt)</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    handleExportPrompt("md");
+                                    setShowExportMenu(false);
+                                  }}
+                                  id="export-opt-md"
+                                  className="w-full text-left px-2.5 py-1.5 rounded-lg text-[10px] font-mono font-semibold text-slate-200 hover:bg-slate-800 hover:text-cyan-400 flex items-center gap-2 cursor-pointer transition-colors"
+                                >
+                                  <FileCode className="w-3.5 h-3.5 text-cyan-400" />
+                                  <span>Markdown (.md)</span>
+                                </button>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Copy button */}
+                          <button
+                            type="button"
+                            onClick={() => handleCopyText(synthesized.finalPrompt)}
+                            className="p-2 bg-slate-900 rounded-lg shadow-md border border-slate-800 text-slate-300 hover:text-cyan-400 transition-colors flex items-center gap-1 text-[10px] font-bold font-mono cursor-pointer"
+                          >
+                            {copiedFinal ? (
+                              <>
+                                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                <span className="text-emerald-400">COPIED</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" />
+                                <span>COPY FINAL</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
 
                         {/* Architect notes block */}
                         <div className="mt-3 bg-cyan-950/40 p-3 rounded-xl text-[10px] text-cyan-300 border border-cyan-800/30 flex gap-2 leading-relaxed">
@@ -1615,7 +1827,10 @@ export default function App() {
 
                       {/* Optimization History Visualizations */}
                       {optimizationHistory.length > 0 && (
-                        <OptimizationHistoryChart history={optimizationHistory} />
+                        <OptimizationHistoryChart 
+                          history={optimizationHistory} 
+                          onRestoreStep={handleRestoreStep}
+                        />
                       )}
 
                     </div>

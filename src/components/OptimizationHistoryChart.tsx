@@ -16,15 +16,18 @@ import {
   Activity, 
   Layers,
   ChevronRight,
-  Maximize2
+  Maximize2,
+  RotateCcw,
+  History
 } from "lucide-react";
 import { OptimizationStep } from "../types";
 
 interface Props {
   history: OptimizationStep[];
+  onRestoreStep?: (step: OptimizationStep) => void;
 }
 
-export function OptimizationHistoryChart({ history }: Props) {
+export function OptimizationHistoryChart({ history, onRestoreStep }: Props) {
   const [metric, setMetric] = useState<"complexity" | "wordCount" | "length">("complexity");
   const [selectedStepIndex, setSelectedStepIndex] = useState<number | null>(null);
   const [compareStepIndex, setCompareStepIndex] = useState<number | null>(null);
@@ -254,13 +257,25 @@ export function OptimizationHistoryChart({ history }: Props) {
               </div>
             </div>
 
-            <div className="flex gap-1.5">
+            <div className="flex items-center gap-1.5 flex-wrap">
               <span className="text-[9px] font-mono bg-cyan-950/40 text-cyan-400 px-2 py-0.5 rounded-md border border-cyan-900/30">
                 Komplexita: {inspectedStep.complexity}%
               </span>
               <span className="text-[9px] font-mono bg-emerald-950/40 text-emerald-400 px-2 py-0.5 rounded-md border border-emerald-900/30">
                 Slov: {inspectedStep.wordCount}
               </span>
+              {onRestoreStep && (
+                <button
+                  type="button"
+                  onClick={() => onRestoreStep(inspectedStep)}
+                  id={`restore-step-btn-${inspectedStep.stepIndex}`}
+                  className="text-[10px] font-mono font-bold text-slate-950 bg-cyan-400 hover:bg-cyan-300 active:scale-95 px-2.5 py-1 rounded-lg flex items-center gap-1 transition-all cursor-pointer shadow-sm shadow-cyan-500/20 ml-1"
+                  title="Obnovit tuto verzi promptu do hlavního okna"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  <span>Obnovit tuto verzi</span>
+                </button>
+              )}
             </div>
           </div>
 
@@ -271,7 +286,20 @@ export function OptimizationHistoryChart({ history }: Props) {
               <div className="space-y-1">
                 <div className="flex items-center justify-between text-[8px] font-mono font-bold text-slate-500 uppercase tracking-wider">
                   <span>Srovnávací Krok: {compareStep.label}</span>
-                  <span>{compareStep.wordCount} slov</span>
+                  <div className="flex items-center gap-1.5">
+                    <span>{compareStep.wordCount} slov</span>
+                    {onRestoreStep && (
+                      <button
+                        type="button"
+                        onClick={() => onRestoreStep(compareStep)}
+                        className="text-[9px] font-mono font-bold text-purple-300 bg-purple-950/80 hover:bg-purple-900 border border-purple-800/60 px-2 py-0.5 rounded flex items-center gap-1 cursor-pointer"
+                        title="Obnovit tuto srovnávanou verzi"
+                      >
+                        <RotateCcw className="w-2.5 h-2.5" />
+                        <span>Obnovit</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="bg-slate-950 rounded-lg p-2 max-h-[140px] overflow-y-auto border border-slate-900 text-[10px] font-mono text-slate-400 whitespace-pre-wrap leading-relaxed select-all">
                   {compareStep.prompt}
@@ -282,7 +310,20 @@ export function OptimizationHistoryChart({ history }: Props) {
               <div className="space-y-1">
                 <div className="flex items-center justify-between text-[8px] font-mono font-bold text-slate-500 uppercase tracking-wider">
                   <span>Zvolený Krok: {inspectedStep.label}</span>
-                  <span className="text-cyan-400">{inspectedStep.wordCount} slov</span>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-cyan-400">{inspectedStep.wordCount} slov</span>
+                    {onRestoreStep && (
+                      <button
+                        type="button"
+                        onClick={() => onRestoreStep(inspectedStep)}
+                        className="text-[9px] font-mono font-bold text-cyan-950 bg-cyan-400 hover:bg-cyan-300 px-2 py-0.5 rounded flex items-center gap-1 cursor-pointer"
+                        title="Obnovit tuto zvolenou verzi"
+                      >
+                        <RotateCcw className="w-2.5 h-2.5" />
+                        <span>Obnovit</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="bg-slate-950 rounded-lg p-2 max-h-[140px] overflow-y-auto border border-cyan-900/20 text-[10px] font-mono text-slate-300 whitespace-pre-wrap leading-relaxed select-all">
                   {inspectedStep.prompt}
@@ -323,6 +364,85 @@ export function OptimizationHistoryChart({ history }: Props) {
           </div>
         </div>
       )}
+
+      {/* All Historical Steps Timeline List with Restore buttons */}
+      <div className="bg-slate-900/20 border border-slate-850 rounded-xl p-3 space-y-2" id="historical-steps-list-container">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1.5">
+            <History className="w-3.5 h-3.5 text-cyan-400" />
+            <h5 className="text-[10px] font-bold text-slate-300 uppercase font-mono tracking-wider">
+              Přehled historických verzí ({history.length})
+            </h5>
+          </div>
+          <span className="text-[9px] font-mono text-slate-500">
+            Kliknutím na Obnovit vrátíte libovolný krok
+          </span>
+        </div>
+
+        <div className="space-y-1.5 max-h-[170px] overflow-y-auto pr-1 no-scrollbar">
+          {history.map((step, idx) => {
+            const isCurrentActive = idx === activeInspectIdx;
+            return (
+              <div 
+                key={idx}
+                className={`flex items-center justify-between p-2 rounded-xl border text-xs transition-all ${
+                  isCurrentActive
+                    ? "bg-slate-900/90 border-cyan-500/50 text-slate-100 shadow-xs"
+                    : "bg-slate-950/70 border-slate-900 hover:border-slate-800 text-slate-400"
+                }`}
+              >
+                <div 
+                  className="flex items-center gap-2.5 flex-1 min-w-0 cursor-pointer"
+                  onClick={() => setSelectedStepIndex(idx)}
+                >
+                  <span className={`w-5 h-5 rounded-full flex items-center justify-center font-mono text-[9px] font-bold shrink-0 ${
+                    isCurrentActive ? "bg-cyan-500 text-slate-950" : "bg-slate-900 text-slate-400 border border-slate-800"
+                  }`}>
+                    #{step.stepIndex}
+                  </span>
+                  <div className="truncate">
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-semibold text-[11px] truncate text-slate-200">
+                        {step.label}
+                      </span>
+                      {idx === history.length - 1 && (
+                        <span className="text-[8px] bg-cyan-950 text-cyan-400 px-1.5 py-0.2 rounded font-mono font-bold border border-cyan-800/40">
+                          AKTUÁLNÍ
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-[9px] font-mono text-slate-500 block">
+                      {step.timestamp} • Komplexita {step.complexity}% • {step.wordCount} slov • {step.length} znaků
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-1.5 shrink-0 ml-2">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedStepIndex(idx)}
+                    className="px-2 py-1 text-[9px] font-mono text-slate-400 hover:text-slate-200 bg-slate-900 rounded-lg border border-slate-800 cursor-pointer"
+                  >
+                    Inspekce
+                  </button>
+                  {onRestoreStep && (
+                    <button
+                      type="button"
+                      onClick={() => onRestoreStep(step)}
+                      id={`restore-history-item-${idx}`}
+                      className="px-2.5 py-1 text-[9px] font-mono font-bold text-slate-950 bg-cyan-400 hover:bg-cyan-300 active:scale-95 rounded-lg flex items-center gap-1 transition-all cursor-pointer shadow-xs"
+                      title={`Obnovit verzi z kroku #${step.stepIndex} (${step.label})`}
+                    >
+                      <RotateCcw className="w-2.5 h-2.5" />
+                      <span>Obnovit</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
     </div>
   );
 }
