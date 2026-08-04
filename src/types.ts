@@ -50,6 +50,19 @@ export interface SavedPromptSession {
   optimizationHistory?: OptimizationStep[];
 }
 
+export interface CriticWeakPoint {
+  point: string;
+  explanation: string;
+}
+
+export interface CriticReview {
+  score: number;
+  summary: string;
+  weakPoints: CriticWeakPoint[];
+  improvedPrompt: string;
+  isOfflineFallback?: boolean;
+}
+
 export interface LocalEngine {
   id: string;
   name: string;

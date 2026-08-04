@@ -7,7 +7,8 @@ import {
   localGenerateQuestions, 
   localSearchCatalog, 
   localSynthesizePrompt, 
-  localRefinePrompt 
+  localRefinePrompt,
+  localCriticPrompt
 } from "./src/lib/localModel";
 
 dotenv.config();
@@ -309,6 +310,72 @@ Return the result in JSON format:
   } catch (error: any) {
     console.warn("Unexpected error in /api/refine-prompt:", error?.message || error);
     const fallbackResult = localRefinePrompt(req.body?.finalPrompt || "", req.body?.manualEdits || "");
+    return res.json({ ...fallbackResult, isOfflineFallback: true });
+  }
+});
+
+// Endpoint 5: AI Prompt Critic
+app.post("/api/critic-prompt", async (req, res) => {
+  try {
+    const { finalPrompt, originalIdea } = req.body;
+    
+    try {
+      const ai = getGeminiClient();
+      const systemInstruction = `You are an expert AI Prompt Critic & Quality Assurance Auditor.
+Your job is to thoroughly critique a synthesized prompt, locate weak points, explain why and how to fix them, and produce an improved version of the prompt.
+
+Analyze the prompt:
+1. Identify 2-3 concrete weak places (e.g., ambiguity, missing constraints, lack of output format enforcement, missing error handling or variable placeholders).
+2. Explain clearly why each weak point limits prompt performance and how the proposed change fixes it.
+3. Generate a refined, robust, improved version of the prompt ("improvedPrompt").
+4. Provide an overall quality score (0-100) and a brief summary.
+
+Return response strictly as JSON with:
+- "score": number (0-100)
+- "summary": string (brief overview of findings)
+- "weakPoints": array of objects, each with:
+    - "point": string (Name/description of weak place)
+    - "explanation": string (Why it's weak and how it was fixed)
+- "improvedPrompt": string (The complete improved version of the prompt)`;
+
+      const response = await generateContentWithFallback(ai, {
+        contents: `Critique this prompt and provide improvements:\n\nPrompt:\n${finalPrompt}\n\nOriginal Idea:\n${originalIdea || 'Not specified'}`,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              score: { type: Type.INTEGER },
+              summary: { type: Type.STRING },
+              weakPoints: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    point: { type: Type.STRING },
+                    explanation: { type: Type.STRING }
+                  },
+                  required: ["point", "explanation"]
+                }
+              },
+              improvedPrompt: { type: Type.STRING }
+            },
+            required: ["score", "summary", "weakPoints", "improvedPrompt"]
+          }
+        }
+      });
+
+      const result = JSON.parse(response.text || "{}");
+      return res.json(result);
+    } catch (apiError: any) {
+      console.warn("Gemini API unavailable or quota exceeded for prompt critic. Using offline critic engine:", apiError?.message || apiError);
+      const fallbackResult = localCriticPrompt(finalPrompt || "");
+      return res.json({ ...fallbackResult, isOfflineFallback: true });
+    }
+  } catch (error: any) {
+    console.warn("Unexpected error in /api/critic-prompt:", error?.message || error);
+    const fallbackResult = localCriticPrompt(req.body?.finalPrompt || "");
     return res.json({ ...fallbackResult, isOfflineFallback: true });
   }
 });

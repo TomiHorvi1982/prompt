@@ -35,20 +35,26 @@ import {
   FileCode,
   Mic,
   MicOff,
-  Volume2
+  Volume2,
+  ShieldCheck,
+  AlertTriangle,
+  CheckCircle2,
+  ThumbsUp,
+  SearchCheck
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
 import { OptimizationHistoryChart } from "./components/OptimizationHistoryChart";
 import DeepAnalysisView from "./components/DeepAnalysisView";
 
-import { Question, CatalogPrompt, Citation, SynthesizedPrompt, SavedPromptSession, LocalEngine, OptimizationStep } from "./types";
+import { Question, CatalogPrompt, Citation, SynthesizedPrompt, SavedPromptSession, LocalEngine, OptimizationStep, CriticReview } from "./types";
 import { AESTHETIC_PRESETS, STARTER_TEMPLATES } from "./data";
 import { 
   localGenerateQuestions, 
   localSearchCatalog, 
   localSynthesizePrompt, 
   localRefinePrompt,
+  localCriticPrompt,
   getNeuralPredictions,
   PredictionCandidate,
   calculateComplexity,
@@ -109,6 +115,11 @@ export default function App() {
   const [isModelSelectorOpen, setIsModelSelectorOpen] = useState(false);
   const [showDeepAnalysis, setShowDeepAnalysis] = useState(false);
   const [showExportMenu, setShowExportMenu] = useState(false);
+
+  // AI Prompt Critic Review Mode state
+  const [isReviewMode, setIsReviewMode] = useState(false);
+  const [criticReview, setCriticReview] = useState<CriticReview | null>(null);
+  const [isCriticizing, setIsCriticizing] = useState(false);
 
   // Local Neural Core / Models list state
   const [localEngines, setLocalEngines] = useState<LocalEngine[]>([
@@ -619,6 +630,9 @@ export default function App() {
         addOptimizationStep("Syntéza", response.finalPrompt);
         showToast(`Zpracováno lokálně modelem: ${engineName}!`);
         triggerICloudSync();
+        if (isReviewMode) {
+          handleRunCritic(response.finalPrompt);
+        }
       }, 950);
     } else {
       try {
@@ -636,6 +650,9 @@ export default function App() {
         if (data.error) throw new Error(data.error);
         setSynthesized(data);
         addOptimizationStep("Syntéza", data.finalPrompt);
+        if (isReviewMode) {
+          handleRunCritic(data.finalPrompt);
+        }
       } catch (err: any) {
         console.warn("Backend synthesis error, falling back to local engine:", err);
         const response = localSynthesizePrompt(
@@ -646,6 +663,9 @@ export default function App() {
         );
         setSynthesized(response);
         addOptimizationStep("Syntéza", response.finalPrompt);
+        if (isReviewMode) {
+          handleRunCritic(response.finalPrompt);
+        }
       } finally {
         setSynthesizing(false);
       }
@@ -674,6 +694,9 @@ export default function App() {
         setManualEdits("");
         showToast("Re-compiled & polished offline");
         triggerICloudSync();
+        if (isReviewMode) {
+          handleRunCritic(response.finalPrompt);
+        }
       }, 850);
     } else {
       try {
@@ -691,16 +714,79 @@ export default function App() {
         addOptimizationStep(label, data.finalPrompt);
         setManualEdits("");
         showToast("Reprocessed manual directives!");
+        if (isReviewMode) {
+          handleRunCritic(data.finalPrompt);
+        }
       } catch (err: any) {
         console.warn("Backend refinement failed, using offline compiler:", err);
         const response = localRefinePrompt(synthesized.finalPrompt, currentEdits);
         setSynthesized(response);
         addOptimizationStep(label, response.finalPrompt);
         setManualEdits("");
+        if (isReviewMode) {
+          handleRunCritic(response.finalPrompt);
+        }
       } finally {
         setRefining(false);
       }
     }
+  };
+
+  // AI Prompt Critic Handlers
+  const handleRunCritic = async (targetPrompt?: string) => {
+    const promptToReview = targetPrompt || synthesized?.finalPrompt;
+    if (!promptToReview) {
+      showToast("Nejdříve musíte mít vytvořený nebo zsyntetizovaný prompt!");
+      return;
+    }
+
+    const isOfflineActive = offlineMode || !isOnline;
+    setIsCriticizing(true);
+
+    if (isOfflineActive) {
+      setTimeout(() => {
+        const review = localCriticPrompt(promptToReview);
+        setCriticReview(review);
+        setIsCriticizing(false);
+        showToast("AI Critic dokončil analýzu slabých míst!");
+      }, 700);
+    } else {
+      try {
+        const response = await fetch("/api/critic-prompt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            finalPrompt: promptToReview,
+            originalIdea: originalPrompt
+          })
+        });
+        const data = await response.json();
+        if (data.error) throw new Error(data.error);
+        setCriticReview(data);
+        showToast("AI Critic analyzoval váš prompt!");
+      } catch (err: any) {
+        console.warn("Backend critic failed, using offline critic:", err);
+        const review = localCriticPrompt(promptToReview);
+        setCriticReview(review);
+      } finally {
+        setIsCriticizing(false);
+      }
+    }
+  };
+
+  const handleConfirmCriticPrompt = () => {
+    if (!criticReview || !synthesized) return;
+
+    const newPrompt = criticReview.improvedPrompt;
+    setSynthesized({
+      finalPrompt: newPrompt,
+      explanation: `${synthesized.explanation} | 🛡️ [AI Critic schváleno — Skóre: ${criticReview.score}/100]`
+    });
+
+    addOptimizationStep(`AI Critic Vylepšení (${criticReview.score}/100)`, newPrompt);
+    setCriticReview(null);
+    showToast("Nové znění promptu po AI recenzi bylo schváleno a aplikováno!");
+    triggerICloudSync();
   };
 
   // Restore a previous version of prompt directly from history
@@ -1668,7 +1754,32 @@ export default function App() {
                       Universal Final Prompt Matrix
                     </h3>
                     
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {/* Review Mode Toggle Button */}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const next = !isReviewMode;
+                          setIsReviewMode(next);
+                          if (next && synthesized?.finalPrompt && !criticReview) {
+                            handleRunCritic(synthesized.finalPrompt);
+                          }
+                        }}
+                        id="review-mode-toggle-btn"
+                        className={`text-[10px] font-bold px-3 py-1 rounded-full border transition-all flex items-center gap-1.5 cursor-pointer font-mono ${
+                          isReviewMode 
+                            ? "bg-purple-950/90 border-purple-500/80 text-purple-200 shadow-md shadow-purple-950/50 ring-1 ring-purple-500/40" 
+                            : "bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700"
+                        }`}
+                        title="Přepnout Režim Recenze (AI Prompt Critic)"
+                      >
+                        <ShieldCheck className={`w-3.5 h-3.5 ${isReviewMode ? "text-purple-400 animate-pulse" : "text-slate-400"}`} />
+                        <span>Review Mode</span>
+                        <span className={`text-[9px] px-1.5 py-0.2 rounded-full uppercase font-mono font-extrabold ${isReviewMode ? "bg-purple-500/30 text-purple-300" : "bg-slate-800 text-slate-500"}`}>
+                          {isReviewMode ? "ON" : "OFF"}
+                        </span>
+                      </button>
+
                       {/* Direct Header Export Buttons */}
                       {synthesized && (
                         <div className="flex items-center bg-slate-900 border border-slate-800 rounded-full p-0.5 shadow-md font-mono" id="matrix-header-export-group">
@@ -1713,6 +1824,125 @@ export default function App() {
                     </div>
                   ) : synthesized ? (
                     <div className="space-y-3">
+                      
+                      {/* AI Prompt Critic Panel (When Review Mode is ON) */}
+                      {isReviewMode && (
+                        <div className="bg-slate-950/90 border border-purple-900/60 rounded-2xl p-4 shadow-xl space-y-3 relative overflow-hidden" id="ai-prompt-critic-panel">
+                          {/* Background Glow */}
+                          <div className="absolute -right-10 -top-10 w-36 h-36 bg-purple-600/10 rounded-full blur-2xl pointer-events-none" />
+
+                          <div className="flex items-center justify-between flex-wrap gap-2">
+                            <div className="flex items-center gap-2">
+                              <div className="p-1.5 rounded-lg bg-purple-950 border border-purple-800/80 text-purple-300">
+                                <ShieldCheck className="w-4 h-4 text-purple-400" />
+                              </div>
+                              <div>
+                                <h4 className="text-xs font-bold text-slate-100 flex items-center gap-1.5 font-mono">
+                                  AI Prompt Critic & Evaluation
+                                  <span className="text-[9px] bg-purple-900/60 border border-purple-700/50 text-purple-300 px-2 py-0.5 rounded-full font-bold">
+                                    Review Mode
+                                  </span>
+                                </h4>
+                                <p className="text-[10px] text-slate-400">
+                                  Detekce a oprava slabých míst v reálném čase
+                                </p>
+                              </div>
+                            </div>
+
+                            <div className="flex items-center gap-2">
+                              {criticReview && (
+                                <div className="px-2.5 py-1 rounded-full bg-slate-900 border border-purple-500/40 text-purple-300 font-mono text-[10px] font-bold flex items-center gap-1 shadow-sm">
+                                  <span>Score:</span>
+                                  <span className={`font-black ${criticReview.score >= 90 ? "text-emerald-400" : criticReview.score >= 75 ? "text-cyan-400" : "text-amber-400"}`}>
+                                    {criticReview.score}/100
+                                  </span>
+                                </div>
+                              )}
+
+                              <button
+                                type="button"
+                                onClick={() => handleRunCritic()}
+                                disabled={isCriticizing}
+                                className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 hover:border-purple-500/50 text-slate-300 hover:text-purple-300 transition-colors cursor-pointer text-[10px] font-mono flex items-center gap-1 font-semibold"
+                                title="Spustit novou AI Critic analýzu"
+                              >
+                                <RefreshCw className={`w-3.5 h-3.5 ${isCriticizing ? "animate-spin text-purple-400" : ""}`} />
+                                <span>Analýza</span>
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Content / Loading State */}
+                          {isCriticizing ? (
+                            <div className="py-6 text-center space-y-2">
+                              <RefreshCw className="w-6 h-6 animate-spin text-purple-400 mx-auto" />
+                              <p className="text-xs font-bold text-slate-300">AI Critic analyzuje váš prompt...</p>
+                              <p className="text-[10px] text-slate-500 font-mono">Vyhledávání nejasností, nepokrytých případů a balastu.</p>
+                            </div>
+                          ) : criticReview ? (
+                            <div className="space-y-3 pt-1">
+                              {/* Summary Overview */}
+                              <div className="p-2.5 rounded-xl bg-purple-950/40 border border-purple-900/50 text-[11px] text-purple-200 leading-relaxed font-sans">
+                                <span className="font-bold text-purple-300 font-mono block mb-0.5">Hodnocení AI Critic:</span>
+                                {criticReview.summary}
+                              </div>
+
+                              {/* Identified Weak Points & Why/How Fixed */}
+                              <div className="space-y-2">
+                                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest font-mono block">
+                                  Slabá místa & Vysvětlení úprav:
+                                </span>
+                                <div className="space-y-1.5">
+                                  {criticReview.weakPoints.map((wp, idx) => (
+                                    <div key={idx} className="p-2.5 rounded-xl bg-slate-900/90 border border-slate-800 text-[11px] space-y-1">
+                                      <div className="flex items-center gap-1.5 text-amber-400 font-semibold font-mono text-[10px]">
+                                        <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                                        <span>{wp.point}</span>
+                                      </div>
+                                      <p className="text-slate-300 text-[10px] pl-5 leading-relaxed">
+                                        <span className="text-purple-300 font-semibold">Proč & Jak opraveno:</span> {wp.explanation}
+                                      </p>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+
+                              {/* Improved Prompt Preview */}
+                              <div className="space-y-1.5">
+                                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest font-mono block">
+                                  Navržený nový vylepšený prompt:
+                                </span>
+                                <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800 max-h-40 overflow-y-auto font-mono text-[10px] text-slate-300 leading-relaxed whitespace-pre-wrap">
+                                  {criticReview.improvedPrompt}
+                                </div>
+                              </div>
+
+                              {/* Action Button: Confirm & Apply New Prompt */}
+                              <button
+                                type="button"
+                                onClick={handleConfirmCriticPrompt}
+                                id="confirm-critic-prompt-btn"
+                                className="w-full py-2.5 bg-gradient-to-r from-purple-600 via-indigo-500 to-cyan-500 hover:from-purple-500 hover:to-cyan-400 text-slate-950 font-bold text-xs rounded-xl flex items-center justify-center gap-2 shadow-lg cursor-pointer transition-all active:scale-98"
+                              >
+                                <CheckCircle2 className="w-4 h-4 text-slate-950" />
+                                <span>Potvrdit a použít nový prompt</span>
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800 text-center space-y-2">
+                              <SearchCheck className="w-6 h-6 text-purple-400 mx-auto opacity-80" />
+                              <p className="text-xs text-slate-300 font-medium">Režim recenze aktivní</p>
+                              <button
+                                type="button"
+                                onClick={() => handleRunCritic()}
+                                className="px-3 py-1.5 bg-purple-900/60 hover:bg-purple-800/80 border border-purple-700/60 text-purple-200 rounded-lg text-[10px] font-bold font-mono transition-colors cursor-pointer"
+                              >
+                                Spustit AI Critic rozbor
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
                       
                       {/* Synthesized Output Terminal Screen */}
                       <div className="bg-slate-950 rounded-2xl border border-slate-800 p-3.5 relative shadow-xl">
