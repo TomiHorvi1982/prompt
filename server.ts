@@ -61,12 +61,18 @@ async function generateContentWithFallback(ai: GoogleGenAI, config: any, allowSe
         const status = err?.status || err?.code || "";
         const msg = (err?.message || "").toLowerCase();
         
-        const isTransient = status === "UNAVAILABLE" || status === "RESOURCE_EXHAUSTED" || 
-                            status === 503 || status === 429 || status === 500 || status === 502 || status === 504 ||
-                            msg.includes("high demand") || msg.includes("quota") || msg.includes("rate limit") || msg.includes("temporar") || msg.includes("exceeded");
+        const isQuotaDepleted = msg.includes("depleted") || msg.includes("prepayment") || msg.includes("billing") || msg.includes("quota");
+        
+        if (isQuotaDepleted) {
+          // Immediately throw so endpoint catches and uses local offline engine instantly
+          throw err;
+        }
+
+        const isTransient = status === "UNAVAILABLE" || status === 503 || status === 500 || status === 502 || status === 504 ||
+                            msg.includes("high demand") || msg.includes("temporar");
         
         if (isTransient) {
-          const delay = attempt * 1000;
+          const delay = attempt * 500;
           await new Promise(r => setTimeout(r, delay));
           if (attempt === 2 && config.config && config.config.tools) {
             allowSearchTool = false;
@@ -125,12 +131,12 @@ Return a valid JSON array of objects, where each object has:
       const data = JSON.parse(response.text || "[]");
       return res.json({ questions: data });
     } catch (apiError: any) {
-      console.warn("Gemini API unavailable or quota exceeded for questions generation. Using high-performance offline engine:", apiError?.message || apiError);
+      console.info("Gemini API quota reached/unavailable. Using high-performance offline engine for questions generation.");
       const fallbackQuestions = localGenerateQuestions(prompt);
       return res.json({ questions: fallbackQuestions, isOfflineFallback: true });
     }
   } catch (error: any) {
-    console.warn("Unexpected error in /api/generate-questions:", error?.message || error);
+    console.info("Using offline engine for /api/generate-questions.");
     const fallbackQuestions = localGenerateQuestions(req.body?.prompt || "");
     return res.json({ questions: fallbackQuestions, isOfflineFallback: true });
   }
@@ -189,12 +195,12 @@ Return as a valid JSON array.`;
 
       return res.json({ catalog, citations });
     } catch (apiError: any) {
-      console.warn("Gemini API unavailable or quota exceeded for catalog search. Using offline catalog engine:", apiError?.message || apiError);
+      console.info("Gemini API quota reached/unavailable. Using offline catalog engine.");
       const fallbackCatalog = localSearchCatalog(prompt);
       return res.json({ catalog: fallbackCatalog, citations: [], isOfflineFallback: true });
     }
   } catch (error: any) {
-    console.warn("Unexpected error in /api/search-catalog:", error?.message || error);
+    console.info("Using offline catalog engine for /api/search-catalog.");
     const fallbackCatalog = localSearchCatalog(req.body?.prompt || "");
     return res.json({ catalog: fallbackCatalog, citations: [], isOfflineFallback: true });
   }
@@ -244,7 +250,7 @@ Provide the response in JSON format with:
       const result = JSON.parse(response.text || "{}");
       return res.json(result);
     } catch (apiError: any) {
-      console.warn("Gemini API unavailable or quota exceeded for prompt synthesis. Using offline synthesis engine:", apiError?.message || apiError);
+      console.info("Gemini API quota reached/unavailable. Using offline synthesis engine.");
       const fallbackResult = localSynthesizePrompt(
         originalPrompt || "",
         answers || [],
@@ -254,7 +260,7 @@ Provide the response in JSON format with:
       return res.json({ ...fallbackResult, isOfflineFallback: true });
     }
   } catch (error: any) {
-    console.warn("Unexpected error in /api/synthesize-prompt:", error?.message || error);
+    console.info("Using offline engine for /api/synthesize-prompt.");
     const fallbackResult = localSynthesizePrompt(
       req.body?.originalPrompt || "",
       req.body?.answers || [],
@@ -303,12 +309,12 @@ Return the result in JSON format:
       const result = JSON.parse(response.text || "{}");
       return res.json(result);
     } catch (apiError: any) {
-      console.warn("Gemini API unavailable or quota exceeded for prompt refinement. Using offline refinement engine:", apiError?.message || apiError);
+      console.info("Gemini API quota reached/unavailable. Using offline refinement engine.");
       const fallbackResult = localRefinePrompt(finalPrompt || "", manualEdits || "");
       return res.json({ ...fallbackResult, isOfflineFallback: true });
     }
   } catch (error: any) {
-    console.warn("Unexpected error in /api/refine-prompt:", error?.message || error);
+    console.info("Using offline engine for /api/refine-prompt.");
     const fallbackResult = localRefinePrompt(req.body?.finalPrompt || "", req.body?.manualEdits || "");
     return res.json({ ...fallbackResult, isOfflineFallback: true });
   }
@@ -369,12 +375,12 @@ Return response strictly as JSON with:
       const result = JSON.parse(response.text || "{}");
       return res.json(result);
     } catch (apiError: any) {
-      console.warn("Gemini API unavailable or quota exceeded for prompt critic. Using offline critic engine:", apiError?.message || apiError);
+      console.info("Gemini API quota reached/unavailable. Using offline critic engine.");
       const fallbackResult = localCriticPrompt(finalPrompt || "");
       return res.json({ ...fallbackResult, isOfflineFallback: true });
     }
   } catch (error: any) {
-    console.warn("Unexpected error in /api/critic-prompt:", error?.message || error);
+    console.info("Using offline engine for /api/critic-prompt.");
     const fallbackResult = localCriticPrompt(req.body?.finalPrompt || "");
     return res.json({ ...fallbackResult, isOfflineFallback: true });
   }

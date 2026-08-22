@@ -275,6 +275,82 @@ export interface PredictionCandidate {
   completion: string; // The remaining text to be appended
   confidence: number;
   category: string;
+  type?: 'word' | 'incremental' | 'phrase';
+}
+
+/**
+ * Helper to split a full completion into word-by-word (1-2 words), 
+ * incremental sub-phrase (3-5 words), and full phrase candidates.
+ */
+function buildGranularCandidates(
+  cleanInput: string,
+  fullCompletion: string,
+  baseCategory: string
+): PredictionCandidate[] {
+  const result: PredictionCandidate[] = [];
+  if (!fullCompletion || !fullCompletion.trim()) return result;
+
+  const startsWithSpace = fullCompletion.startsWith(" ");
+  const prefix = startsWithSpace ? " " : "";
+  const trimmed = fullCompletion.trim();
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
+
+  if (tokens.length === 0) return result;
+
+  // 1. Next 1-2 words (Word-by-word candidate)
+  let wordCount = 1;
+  const shortArticles = [
+    "a", "v", "s", "o", "k", "z", "na", "i", "se", "ze", "ve", "ke", "to", 
+    "in", "on", "at", "by", "for", "the", "an", "is", "it", "no", "do"
+  ];
+  if (tokens.length > 1 && (tokens[0].length <= 2 || shortArticles.includes(tokens[0].toLowerCase()))) {
+    wordCount = 2;
+  }
+
+  const wordTokens = tokens.slice(0, wordCount);
+  const wordComp = prefix + wordTokens.join(" ");
+
+  if (wordComp && wordComp.trim() !== trimmed) {
+    const label = !startsWithSpace 
+      ? "Slovo po slovu (Dokončení)" 
+      : (wordCount === 1 ? "Slovo po slovu (1 slovo)" : "Slovo po slovu (1-2 slova)");
+      
+    result.push({
+      phrase: cleanInput + wordComp,
+      completion: wordComp,
+      confidence: 98,
+      category: label,
+      type: 'word'
+    });
+  }
+
+  // 2. Next 3-5 words (Sub-phrase / Incremental candidate)
+  if (tokens.length >= 3) {
+    const subCount = Math.min(tokens.length - 1, Math.max(3, wordCount + 2));
+    const subTokens = tokens.slice(0, subCount);
+    const subComp = prefix + subTokens.join(" ");
+
+    if (subComp !== trimmed && !result.some(r => r.completion === subComp)) {
+      result.push({
+        phrase: cleanInput + subComp,
+        completion: subComp,
+        confidence: 94,
+        category: `Inkrementální krok (${subCount} slov)`,
+        type: 'incremental'
+      });
+    }
+  }
+
+  // 3. Full phrase
+  result.push({
+    phrase: cleanInput + fullCompletion,
+    completion: fullCompletion,
+    confidence: 90,
+    category: baseCategory,
+    type: 'phrase'
+  });
+
+  return result;
 }
 
 const PREDICTION_DATABASE: { triggers: string[]; fullPhrase: string; category: string }[] = [
@@ -406,54 +482,120 @@ const PREDICTION_DATABASE: { triggers: string[]; fullPhrase: string; category: s
 export function getNeuralPredictions(inputText: string): PredictionCandidate[] {
   if (!inputText || inputText.trim().length < 2) return [];
   
-  const cleanInput = inputText.trim().toLowerCase();
+  const cleanInput = inputText.trim();
+  const lower = cleanInput.toLowerCase();
   
-  // Find predictions where either:
-  // - The input starts one of the triggers
-  // - The input is a partial match of the fullPhrase itself
-  const matches: PredictionCandidate[] = [];
+  const rawCompletions: { category: string; completion: string }[] = [];
 
+  // 1. Check static database for direct trigger or prefix matches
   for (const item of PREDICTION_DATABASE) {
-    // Check direct trigger matching
-    const hasTriggerMatch = item.triggers.some(tr => cleanInput === tr || cleanInput.endsWith(" " + tr));
-    // Check if the input starts the fullPhrase
-    const startsPhrase = item.fullPhrase.toLowerCase().startsWith(cleanInput);
+    const hasTriggerMatch = item.triggers.some(tr => lower === tr || lower.endsWith(" " + tr));
+    const startsPhrase = item.fullPhrase.toLowerCase().startsWith(lower);
 
     if (hasTriggerMatch || startsPhrase) {
       let completion = "";
       if (startsPhrase) {
-        completion = item.fullPhrase.substring(inputText.length);
+        completion = item.fullPhrase.substring(cleanInput.length);
       } else {
-        // Try to replace the last trigger with the full phrase or append
-        const lastWord = cleanInput.split(" ").pop() || "";
-        const triggerIndex = item.triggers.indexOf(lastWord);
-        if (triggerIndex !== -1) {
-          const phraseWords = item.fullPhrase.split(" ");
-          // Find if we can calculate a smooth completion
-          completion = " " + phraseWords.slice(1).join(" ");
-        } else {
-          completion = " " + item.fullPhrase;
-        }
+        completion = " " + item.fullPhrase;
       }
 
-      // Calculate pseudo-confidence based on match type & length
-      let confidence = 85 + Math.min(14, cleanInput.length * 2);
-      if (startsPhrase) confidence += 3;
-      if (confidence > 99) confidence = 99;
-
-      // Avoid duplicates
-      if (!matches.some(m => m.phrase === item.fullPhrase)) {
-        matches.push({
-          phrase: item.fullPhrase,
+      if (completion && !rawCompletions.some(m => m.completion.trim() === completion.trim())) {
+        rawCompletions.push({
           completion: completion,
-          confidence: confidence,
           category: item.category
         });
       }
     }
   }
 
-  return matches.slice(0, 3); // Return top 3 high-confidence neural candidates
+  // 2. Czech & English Contextual Dynamic Intent Engine
+  const isCzech = /[áčďéěíňóřšťúůýž]/i.test(cleanInput) || 
+                  /\b(vytvor|vytvoř|napis|napiš|je|pro|na|jak|co|krok|tabulka|kod|kód|navrh|navrhni|analyz|pravidla|proc|proč|ktery|který|připrav|priprav)\b/i.test(lower);
+
+  const isCode = /\b(kod|kód|code|app|aplikac|web|html|css|react|typescript|ts|js|swiftui|python|api|databaz|sql|komponent|funkc)\b/i.test(lower);
+  const isWriting = /\b(napis|napiš|write|clanek|článek|blog|copy|email|e-mail|text|marketing|prodej|pribeh|příběh|post)\b/i.test(lower);
+  const isDesign = /\b(design|ui|ux|vzhled|barv|styl|ilustr|layout|visual|font|figma|tailwind)\b/i.test(lower);
+  const isHowTo = /^(jak|how)\b/i.test(lower);
+  const isWhatWhy = /^(co|proč|proc|what|why)\b/i.test(lower);
+
+  let dynamicOptions: { category: string; completion: string }[] = [];
+
+  if (isCzech) {
+    if (isCode) {
+      dynamicOptions = [
+        { category: "TypeScript & React", completion: " a napiš kompletní spouštitelný kód v Reactu s Tailwind CSS, správa stavu a ošetřením chyb." },
+        { category: "Architektura", completion: " v čisté architektuře s přehlednými komentáři, znovupoužitelnými komponentami a výjimkami." },
+        { category: "UX & Responzivita", completion: " včetně responzivního layoutu pro mobil i desktop, klávesových zkratek a ARIA přístupnosti." }
+      ];
+    } else if (isWriting) {
+      dynamicOptions = [
+        { category: "AIDA Copywriting", completion: " pomocí prodejní metody AIDA s chytlavými podnadpisy, přehlednými odrážkami a silným CTA." },
+        { category: "Expertní Tón", completion: " profesionálním a čtivým tónem, omez konverzační vatu a zdůrazni hlavní přínosy pro uživatele." },
+        { category: "Příběhový Narativ", completion: " jako poutavý příběh s konkrétními příklady z reálné praxe a shrnutím klíčových bodů." }
+      ];
+    } else if (isDesign) {
+      dynamicOptions = [
+        { category: "HEX & Tailwind", completion: " s definicí přesné barevné palety (HEX), typografie, Tailwind CSS tříd a pravidel rozestupů." },
+        { category: "Moderní UI/UX", completion: " v čistém minimalistickém stylu s důrazem na přístupnost (WCAG AA) a plynulé mikromomenty." },
+        { category: "Design Systém", completion: " jako znovupoužitelný design systém včetně stavových efektů (hover, focus, disabled)." }
+      ];
+    } else if (isHowTo) {
+      dynamicOptions = [
+        { category: "Návod Krok za Krokem", completion: " krok za krokem s časovým odhadem jednotlivých fází a názornými ukázkami z praxe." },
+        { category: "3 Účinné Metody", completion: " s využitím 3 nejúčinnějších metod v oboru, srovnáním výhod a doporučeným postupem." },
+        { category: "Checklist & Chyby", completion: " včetně praktického kontrolního seznamu (checklistu) a varování před nejčastějšími chybami." }
+      ];
+    } else if (isWhatWhy) {
+      dynamicOptions = [
+        { category: "Srozumitelné Vysvětlení", completion: " srozumitelně s názornou analogií a 3 klíčovými poznatky v přehledných odrážkách." },
+        { category: "Analýza & Srovnání", completion: " z pohledu seniorního experta včetně srovnávací tabulky a doporučených dalších kroků." },
+        { category: "Mýty vs. Fakta", completion: " ve formě stručných otázek a odpovědí (FAQ) s vyvrácením nejčastějších mýtů." }
+      ];
+    } else {
+      dynamicOptions = [
+        { category: "Strukturované Řešení", completion: " a rozepiš řešení do přehledných sekcí s odrážkami, konkrétními příklady a bez balastu." },
+        { category: "Senior Persona", completion: " z pohledu experta s 15 lety praxe v oboru s důrazem na best practices a ošetření rizik." },
+        { category: "Analýza & Kód", completion: " s podrobnou analýzou možností, porovnáním variant a doporučenou finální specifikací." }
+      ];
+    }
+  } else {
+    // English dynamic fallbacks
+    dynamicOptions = [
+      { category: "Structured Output", completion: " with clear headers, bullet points, real-world examples, and actionable takeaways." },
+      { category: "Senior Staff Engineer", completion: " adopting a Senior Staff Engineer persona, handling edge cases and performance tradeoffs." },
+      { category: "Complete Specification", completion: " providing a full production-ready implementation with inline TS documentation." }
+    ];
+  }
+
+  // Merge dynamic options into raw completions
+  for (const opt of dynamicOptions) {
+    if (rawCompletions.length >= 3) break;
+    if (!rawCompletions.some(m => m.completion.trim() === opt.completion.trim())) {
+      rawCompletions.push(opt);
+    }
+  }
+
+  // 3. Build granular candidates (word-by-word, incremental, full phrase)
+  const finalCandidates: PredictionCandidate[] = [];
+
+  rawCompletions.forEach((raw, idx) => {
+    const granular = buildGranularCandidates(cleanInput, raw.completion, raw.category);
+    
+    granular.forEach(cand => {
+      if (!finalCandidates.some(c => c.completion.trim() === cand.completion.trim())) {
+        // Boost primary word-by-word and incremental candidates so they appear near top
+        if (idx === 0 && cand.type === 'word') cand.confidence = 99;
+        if (idx === 0 && cand.type === 'incremental') cand.confidence = 95;
+        finalCandidates.push(cand);
+      }
+    });
+  });
+
+  // Sort candidates so word-by-word and incremental are prominent first options, followed by full phrases
+  finalCandidates.sort((a, b) => b.confidence - a.confidence);
+
+  return finalCandidates.slice(0, 5);
 }
 
 export function calculateComplexity(prompt: string): number {
@@ -491,104 +633,281 @@ export function calculateComplexity(prompt: string): number {
   return Math.round(Math.min(Math.max(score, 10), 100));
 }
 
-export interface CommaSuggestions {
-  relevant: string;
-  inspiring: string;
-  unusual: string;
+// Question Mark Smart Prediction Generator
+export interface QuestionMarkPredictionCandidate {
+  id: string;
+  category: string;
+  title: string;
+  completion: string;
+  fullTextPreview: string;
 }
 
-export function getCommaPredictions(prompt: string): CommaSuggestions {
-  if (!prompt) {
-    return {
-      relevant: "přidej přesný kontext a omez konverzační vatu",
-      inspiring: "zformuluj zadání jako expert s 15 lety praxe v oboru",
-      unusual: "přidej požadavek na vysvětlení principů formou vtipné analogie"
-    };
-  }
+export function getQuestionMarkPredictions(prompt: string): QuestionMarkPredictionCandidate[] {
+  if (!prompt || !prompt.includes('?')) return [];
 
-  const lower = prompt.toLowerCase();
-  
-  // Detect language: Czech vs English
-  const isCzech = /[áčďéěíňóřšťúůýž]/i.test(prompt) || 
-                  /\b(vytvor|napis|je|pro|na|jak|co|krok|tabulka|kod|navrh|analyz|pravidla)\b/i.test(lower);
+  const qIndex = prompt.indexOf('?');
+  const beforeQ = prompt.substring(0, qIndex).trim();
+  const afterQ = prompt.substring(qIndex + 1);
 
-  // Detect domains
-  const isTech = /\b(kod|code|app|web|html|css|react|typescript|js|swiftui|python|api|databaz|sql|funkc|program|server)\b/i.test(lower);
-  const isWriting = /\b(napis|write|clanek|article|blog|copy|email|text|marketing|prodej|pribeh|titulek|zprav|obsah|post|scenar|sequence)\b/i.test(lower);
-  const isDesign = /\b(design|ui|ux|vzhled|barv|styl|ilustr|tvorb|graphics|layout|visual|preset|tlač|font|typograf)\b/i.test(lower);
-  const isAnalysis = /\b(analyz|strateg|data|vypoc|report|audit|finan|business|trh|konkur|metrics|risk|finance|scenar)\b/i.test(lower);
+  if (!beforeQ) return [];
+
+  const lower = beforeQ.toLowerCase();
+  const isCzech = /[áčďéěíňóřšťúůýž]/i.test(beforeQ) || 
+                  /\b(vytvor|napis|je|pro|na|jak|co|krok|tabulka|kod|navrh|analyz|pravidla|proc|ktery|kolik|kdy|kde|kdo)\b/i.test(lower);
+
+  // Extract key topic elements from beforeQ
+  const isLandingPage = /\b(landing|page|strank|web|prezentace|webov|konverz)\b/i.test(lower);
+  const isReactDev = /\b(react|typescript|ts|js|javascript|kód|kod|komponent|kalkulač|kalkulacka|app|aplikac|funkce|api|backend|frontend)\b/i.test(lower);
+  const isEmail = /\b(email|e-mail|zpráv|zprav|dopis|mail|klient|zákazník|zakaznik|oslovení)\b/i.test(lower);
+  const isMarketing = /\b(marketing|reklam|kampan|kampáň|titulek|prodej|copywriting|post|social|faktura)\b/i.test(lower);
+  const isDesign = /\b(design|ui|ux|vzhled|barv|layout|grafik|písmo|logo|figma|tailwind)\b/i.test(lower);
+  const isCooking = /\b(recept|vaření|vareni|jídlo|jidlo|těstovin|polevk|dort|pečení|peveni|kuchařka|obed|vecer)\b/i.test(lower);
+  const isFitness = /\b(fitness|dieta|trénink|trenink|cvičení|cviceni|hubnutí|hubnuti|strava|svaly|zdraví)\b/i.test(lower);
+  const isFinance = /\b(peníze|penize|finance|investic|rozpočet|rozpocet|hypoték|hypoteka|banka|akcie|krypto)\b/i.test(lower);
+
+  // Intent patterns
+  const isHowTo = /^(jak|how)\b/i.test(lower);
+  const isWhatWhy = /^(co|proč|proc|what|why|kdo|kdy|kde|který|ktery)\b/i.test(lower);
+  const isCreateCmd = /\b(vytvoř|vytvor|napiš|napis|sepiš|sepis|generuj|navrhni|zpracuj|připrav|priprav|write|create|build)\b/i.test(lower);
+
+  let candidates: { category: string; title: string; completion: string }[] = [];
 
   if (isCzech) {
-    if (isTech) {
-      return {
-        relevant: "zaměř se na maximální čitelnost, čistou strukturu kódu a přidej podrobné komentáře k nejsložitějším částem.",
-        inspiring: "implementuj moderní asynchronní vzory s ošetřením všech chybových stavů a logováním chyb.",
-        unusual: "přidej instrukci, aby kód fungoval zcela offline a byl optimalizovaný pro extrémně nízkou paměťovou náročnost."
-      };
+    if (isLandingPage) {
+      candidates = [
+        {
+          category: "Konverzní Framework",
+          title: "AIDA + 5 Sekcí & CTA",
+          completion: " Rozepiš 5 klíčových sekcí od chytlavého nadpisu po CTA tlačítko, použij konverzní metodu AIDA a přidej konkrétní ukázky textu pro SaaS produkt."
+        },
+        {
+          category: "Copywriting & Nadpisy",
+          title: "Šablona Nadpisů & Odstranění Námitek",
+          completion: " Vytvoř 3 varianty úderného hlavního nadpisu (Hero Headline), odpověz na hlavní zákaznické námitky a přidej sekci s recenzemi (Social Proof)."
+        },
+        {
+          category: "UX & Struktura Stránky",
+          title: "Layout + A/B Testování",
+          completion: " Navrhni vizuální rozvržení prvků (F-pattern), definuj ideální barevné akcenty pro tlačítka a uveď 3 tipy pro zvýšení míry konverze (CR)."
+        }
+      ];
+    } else if (isReactDev) {
+      candidates = [
+        {
+          category: "Kompletní Kód",
+          title: "TypeScript + Tailwind CSS Component",
+          completion: " Napiš kompletní spouštitelný kód v TypeScriptu s použitím Tailwind CSS, přidej správa stavu (useState/useReducer) a ošetření chybových stavů."
+        },
+        {
+          category: "Expertní Architektura",
+          title: "Senior Modulární Návrh & Komentáře",
+          completion: " Pojmi kód podle osvědčených architektonických pravidel, rozbij řešení na znovupoužitelné podkomponenty a doplň podrobné komentáře."
+        },
+        {
+          category: "UX & Responzivita",
+          title: "Responzivní UI & Podpora Klávesnice",
+          completion: " Přidej responzivní zobrazení pro mobil i desktop, podporu klávesových zkratek, přístupnost (ARIA) a možnost exportu výsledných dat."
+        }
+      ];
+    } else if (isEmail) {
+      candidates = [
+        {
+          category: "Profesionální Tón",
+          title: "3 Předměty + Empatické Oslovení",
+          completion: " Formuluj e-mail profesionálním a zároveň empatickým tónem, uveď 3 chytlavé varianty předmětu a přidej jasnou výzvu k akci (CTA)."
+        },
+        {
+          category: "Konkrétní Řešení",
+          title: "Stručný Text + Další Kroky",
+          completion: " Rozděl text na krátké odstavce bez zbytečné vaty, jasně uveď důvod, nabídni konkrétní kompenzaci/řešení a uveď kontakt na podporu."
+        },
+        {
+          category: "Šablona s Proměnnými",
+          title: "Personalizovaný E-mail (Variables)",
+          completion: " Sepiš zprávu ve formě univerzální šablony s proměnnými {{jméno}}, {{číslo_objednávky}} a přidej doporučený čas pro odeslání."
+        }
+      ];
+    } else if (isCooking) {
+      candidates = [
+        {
+          category: "Detailní Recept",
+          title: "Ingredience + Postup Krok za Krokem",
+          completion: " Uveď přesný seznam surovin v gramážích, časovou náročnost, postup přípravy krok za krokem a tipy pro dokonalé dochucení."
+        },
+        {
+          category: "Nutriční Hodnoty",
+          title: "Makroživiny & Zdravější Varianta",
+          completion: " Doplň přehled kalorií a makroživin (bílkoviny, sacharidy, tuky), a navrhni lehkou alternativu pro nízkosacharidovou dietu."
+        },
+        {
+          category: "Kuchařské Triky",
+          title: "Šéfkuchařské Rady & Servírování",
+          completion: " Přidej 3 šéfkuchařské triky pro správnou texturu, nápady na estetické servírování a doporučené párování s nápoji."
+        }
+      ];
+    } else if (isFitness) {
+      candidates = [
+        {
+          category: "Tréninkový Plán",
+          title: "Rozpis Cviků + Série & Opakování",
+          completion: " Sepiš strukturovaný týdenní plán cviků, uveď počet sérií, opakování, přestávek a správnou techniku dýchání."
+        },
+        {
+          category: "Regenerace & Strava",
+          title: "Jídelníček & Suplementace",
+          completion: " Doporuč optimální denní příjem bílkovin, hydrataci, vhodné doplňky stravy a tipy pro kvalitní spánek a regeneraci svalů."
+        },
+        {
+          category: "Začátečník vs. Pokročilý",
+          title: "Progrese Zátěže & Prevence Zranění",
+          completion: " Vysvětli princip postupné progrese zátěže (progressive overload), uveď nejčastější chyby při cvičení a prevenci zranění."
+        }
+      ];
+    } else if (isHowTo) {
+      candidates = [
+        {
+          category: "Strukturovaný Návod",
+          title: "Postup Krok za Krokem + Příklady",
+          completion: " Uveď podrobný návod krok za krokem, časový odhad pro jednotlivé fáze a konkrétní praktické příklady z reálné praxe."
+        },
+        {
+          category: "Expertní Srovnání",
+          title: "3 Metody + Výhody & Nevýhody",
+          completion: " Popiš 3 nejúčinnější přístupy, porovnej jejich výhody i nevýhody a doporuč nejvhodnější postup pro rychlé výsledky."
+        },
+        {
+          category: "Praktický Checklist",
+          title: "Kontrolní Seznam & Časté Chyby",
+          completion: " Přidej praktický checklist klíčových bodů k ověření, nejčastější úskalí a tipy, jak ušetřit čas a vyhnout se zbytečným chybám."
+        }
+      ];
+    } else if (isWhatWhy) {
+      candidates = [
+        {
+          category: "Jasná Definice",
+          title: "Srozumitelné Vysvětlení + Analogie",
+          completion: " Vysvětli téma srozumitelně i pro laika, uveď názornou vtipnou analogii a na závěr připoj 3 klíčové poznatky v bodech."
+        },
+        {
+          category: "Hluboká Analýza",
+          title: "Expertní Pohled & Srovnávací Tabulka",
+          completion: " Pojmi odpověď z pohledu experta v oboru, porovnej hlavní koncepty v přehledné tabulce a přidej historický nebo odborný kontext."
+        },
+        {
+          category: "Otázky & Odpovědi",
+          title: "FAQ Format + Mýty vs. Fakta",
+          completion: " Zpracuj odpověď formou stručných dotazů a odpovědí (FAQ), vyvrať 3 nejčastější mýty a zdůrazni praktický dopad pro uživatele."
+        }
+      ];
+    } else if (isCreateCmd) {
+      candidates = [
+        {
+          category: "Kompletní Výstup",
+          title: "Strukturovaný Text bez Balastu",
+          completion: " Sepiš kompletní finální výstup v přehledných sekcích s chytlavými podnadpisy, odrážkami a zcela vynechej konverzační úvody."
+        },
+        {
+          category: "Expertní Úroveň",
+          title: "Senior Persona & Best Practices",
+          completion: " Zformuluj zadání jako expert s 15 lety praxe, zdůrazni klíčové standardy kvality a ošetři hraniční případy (edge-cases)."
+        },
+        {
+          category: "Více Variant",
+          title: "3 Různé Stylistické Varianty",
+          completion: " Nabídni 3 různé varianty zpracování (stručnou formální, kreativní neformální a detailní analytickou)."
+        }
+      ];
+    } else {
+      candidates = [
+        {
+          category: "Přehledná Odpověď",
+          title: "Strukturované Odrážky + Příklady",
+          completion: " Rozepiš odpověď do přehledných bodů s názornými ukázkami z praxe, jasným shrnutím a vynecháním zbytečného balastu."
+        },
+        {
+          category: "Analytický Přístup",
+          title: "Krok za Krokem & Zdůvodnění",
+          completion: " Postupuj krok za krokem (Chain-of-Thought), u každého kroku stručně uveď logické zdůvodnění a připoj doporučené další kroky."
+        },
+        {
+          category: "Expertní Standard",
+          title: "Senior Specifikace & Tabulka",
+          completion: " Pojmi odpověď z pohledu špičkového odborníka, shrň klíčová pravidla v přehledné srovnávací tabulce a přidej kontrolní otázky."
+        }
+      ];
     }
-    if (isWriting) {
-      return {
-        relevant: "rozděl celý text do přehledných, krátkých odstavců s chytlavými podnadpisy pro snadnou čitelnost.",
-        inspiring: "použij uznávanou prodejní metodu AIDA a vytvoř silný emocionální apel zaměřený na hlavní přínosy.",
-        unusual: "koncipuj celý text jako strhující dialog se zvídavým cestovatelem v čase, který se právě ocitl v dnešní době."
-      };
-    }
-    if (isDesign) {
-      return {
-        relevant: "definuj barevnou paletu pomocí HEX kódů, udržuj perfektní kontrast, vzdušnost a ostré kontury.",
-        inspiring: "zakomponuj do celého konceptu nadčasové principy skandinávského minimalismu a geometrické čistoty.",
-        unusual: "navrhni to s ohledem na unaveného uživatele pracujícího v noci, s využitím šetrných pastelových tónů."
-      };
-    }
-    if (isAnalysis) {
-      return {
-        relevant: "výsledky uspořádej do přehledné srovnávací tabulky a jasně zvýrazni klíčové metriky a rizika.",
-        inspiring: "přidej prediktivní model pro příští 3 roky se zohledněním konzervativního, realistického i optimistického scénáře.",
-        unusual: "odhal skryté hrozby typu černá labuť (nepředvídatelné události), které by mohly tuto strategii ohrozit."
-      };
-    }
-    // General Czech
-    return {
-      relevant: "definuj jasnou roli pro AI, omez nepodstatný úvodní text a přesně popiš požadovanou strukturu výstupu.",
-      inspiring: "postupuj krok za krokem (Chain-of-Thought) a u každého kroku uveď stručné logické zdůvodnění.",
-      unusual: "na samotný konec výstupu doplň 3 kritické otázky, které by mohl oponent položit k zpochybnění tvých závěrů."
-    };
   } else {
-    // English responses
-    if (isTech) {
-      return {
-        relevant: "ensure clean code styling, robust type-safety boundaries, and add documentation comments to all major functions.",
-        inspiring: "leverage advanced performance-optimization patterns including memoization, lazy evaluation, and smart caching.",
-        unusual: "write the final code and comments as if you are a witty 1980s mainframe system operator drinking way too much coffee."
-      };
+    // English dynamic predictions based on prompt context
+    if (isReactDev) {
+      candidates = [
+        {
+          category: "Production Code",
+          title: "TypeScript + Tailwind Component",
+          completion: " Provide a fully working TypeScript component using Tailwind CSS, state management (useState/useReducer), and clean error handling."
+        },
+        {
+          category: "Architecture",
+          title: "Modular Senior Developer Structure",
+          completion: " Structure the solution into reusable sub-components, follow clean code principles, and add inline TS doc comments."
+        },
+        {
+          category: "Responsive UI",
+          title: "Responsive Layout & ARIA Accessibility",
+          completion: " Include responsive mobile/desktop layouts, keyboard navigation shortcuts, ARIA accessibility attributes, and data export options."
+        }
+      ];
+    } else if (isLandingPage) {
+      candidates = [
+        {
+          category: "Conversion Framework",
+          title: "AIDA + 5 Key Sections",
+          completion: " Outline 5 essential sections from Hero headline to CTA, apply the AIDA framework, and provide copy examples for a SaaS product."
+        },
+        {
+          category: "Copywriting",
+          title: "Headlines & Objection Handling",
+          completion: " Craft 3 high-converting headline variations, directly address key customer objections, and include a social proof testimonial layout."
+        },
+        {
+          category: "UX & CRO",
+          title: "Layout Grid & A/B Testing Tips",
+          completion: " Design the visual grid hierarchy, specify accent colors for conversion buttons, and provide 3 actionable CRO optimization tips."
+        }
+      ];
+    } else {
+      candidates = [
+        {
+          category: "Structured Output",
+          title: "Bullet Points + Practical Examples",
+          completion: " Format the answer with clear skimmable headings, practical real-world examples, zero fluff, and key takeaways."
+        },
+        {
+          category: "Expert Persona",
+          title: "Senior Staff Engineer / Strategist",
+          completion: " Adopt a Senior Staff Engineer persona, analyze edge cases and tradeoffs step-by-step, and recommend optimal best practices."
+        },
+        {
+          category: "Actionable Template",
+          title: "Ready-to-Use Output Schema",
+          completion: " Deliver a production-ready structured template, a comparison matrix table, and a verification checklist."
+        }
+      ];
     }
-    if (isWriting) {
-      return {
-        relevant: "structure the layout with clear skimmable bullet points, active verbs, and action-oriented section headers.",
-        inspiring: "apply the StoryBrand narrative framework to position the user as the hero and the product as the guide.",
-        unusual: "integrate a subtle, elegant rhyme scheme into the value proposition statement to make it instantly memorable."
-      };
-    }
-    if (isDesign) {
-      return {
-        relevant: "specify a high-contrast dark aesthetic with exact pixel-perfect padding, borders, and custom Tailwind configs.",
-        inspiring: "incorporate sleek Bauhaus design concepts, emphasizing raw functional aesthetic and clean typography.",
-        unusual: "style the entire user experience to emulate a nostalgic green-phosphor CRT terminal interface with retro glitches."
-      };
-    }
-    if (isAnalysis) {
-      return {
-        relevant: "format the final analysis into a structured executive matrix with a clear traffic-light status system.",
-        inspiring: "apply game theory strategic principles to forecast potential competitor moves and suggest proactive defenses.",
-        unusual: "simulate an absolute worst-case systemic collapse scenario and outline an emergency operational survival protocol."
-      };
-    }
-    // General English
-    return {
-      relevant: "specify exact expert persona roles, eliminate conversational greeting filler, and define strict output schemas.",
-      inspiring: "explain your logical chain of reasoning step-by-step so the user can easily verify your technical path.",
-      unusual: "act as your own devil's advocate to challenge the assumptions and provide a balanced counter-perspective."
-    };
   }
+
+  return candidates.map((item, idx) => {
+    const prefix = beforeQ;
+    const suffix = afterQ ? (afterQ.startsWith(' ') ? afterQ : ' ' + afterQ) : '';
+    const completionClean = item.completion;
+    const fullTextPreview = prefix + completionClean + suffix;
+
+    return {
+      id: `q-pred-${idx}`,
+      category: item.category,
+      title: item.title,
+      completion: completionClean,
+      fullTextPreview: fullTextPreview
+    };
+  });
 }
 

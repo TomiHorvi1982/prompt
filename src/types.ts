@@ -77,3 +77,11 @@ export interface LocalEngine {
   active: boolean;
 }
 
+export interface QuestionMarkPredictionCandidate {
+  id: string;
+  category: string;
+  title: string;
+  completion: string;
+  fullTextPreview: string;
+}
+

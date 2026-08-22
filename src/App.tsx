@@ -10,6 +10,8 @@ import {
   Cloud, 
   CloudCheck, 
   Smartphone, 
+  Tablet,
+  Monitor, 
   ArrowRight, 
   Trash2, 
   Info, 
@@ -29,6 +31,7 @@ import {
   Zap,
   ChevronDown,
   ChevronUp,
+  ChevronRight,
   BarChart3,
   Gauge,
   Download,
@@ -40,14 +43,17 @@ import {
   AlertTriangle,
   CheckCircle2,
   ThumbsUp,
-  SearchCheck
+  SearchCheck,
+  Undo2,
+  Redo2,
+  HelpCircle
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
 import { OptimizationHistoryChart } from "./components/OptimizationHistoryChart";
 import DeepAnalysisView from "./components/DeepAnalysisView";
 
-import { Question, CatalogPrompt, Citation, SynthesizedPrompt, SavedPromptSession, LocalEngine, OptimizationStep, CriticReview } from "./types";
+import { Question, CatalogPrompt, Citation, SynthesizedPrompt, SavedPromptSession, LocalEngine, OptimizationStep, CriticReview, QuestionMarkPredictionCandidate } from "./types";
 import { AESTHETIC_PRESETS, STARTER_TEMPLATES } from "./data";
 import { 
   localGenerateQuestions, 
@@ -58,13 +64,13 @@ import {
   getNeuralPredictions,
   PredictionCandidate,
   calculateComplexity,
-  getCommaPredictions,
-  CommaSuggestions
+  getQuestionMarkPredictions
 } from "./lib/localModel";
 
 export default function App() {
-  // Device Frame State (Simulate high-tech iPhone Frame on Desktop)
+  // Device Frame & Viewport State (Mobile, Tablet, PC)
   const [useDeviceFrame, setUseDeviceFrame] = useState(true);
+  const [deviceView, setDeviceView] = useState<'mobile' | 'tablet' | 'pc'>('mobile');
 
   // Connection & iCloud State
   const [offlineMode, setOfflineMode] = useState(false);
@@ -318,40 +324,133 @@ export default function App() {
     }
   }, [originalPrompt, isPredictionModelDownloaded]);
 
-  // Comma-triggered prediction states & debounce hook
-  const [commaPredictions, setCommaPredictions] = useState<CommaSuggestions | null>(null);
-  const [isCommaPredicting, setIsCommaPredicting] = useState(false);
+  // Question Mark (?) Smart Prediction States & Undo/Redo History Stacks
+  const [questionPredictions, setQuestionPredictions] = useState<QuestionMarkPredictionCandidate[]>([]);
+  const [predictionUndoStack, setPredictionUndoStack] = useState<string[]>([]);
+  const [predictionRedoStack, setPredictionRedoStack] = useState<string[]>([]);
 
-  useEffect(() => {
-    const hasTrailingComma = /,\s*$/.test(originalPrompt);
-    
-    if (hasTrailingComma) {
-      setIsCommaPredicting(true);
-      setCommaPredictions(null);
+  // Active prediction index for cycling variants (Google AI Studio style)
+  const [activePredictionIndex, setActivePredictionIndex] = useState(0);
 
-      const timer = setTimeout(() => {
-        const suggestions = getCommaPredictions(originalPrompt);
-        setCommaPredictions(suggestions);
-        setIsCommaPredicting(false);
-      }, 600);
+  // Active prediction items calculation
+  const isQuestionMode = originalPrompt.includes('?');
+  const currentPredictionList = isQuestionMode ? questionPredictions : predictions;
+  const activeCandidate = currentPredictionList.length > 0
+    ? currentPredictionList[activePredictionIndex % currentPredictionList.length]
+    : null;
 
-      return () => clearTimeout(timer);
+  const activeGhostCompletion = (originalPrompt.trim().length >= 2 && activeCandidate)
+    ? (activeCandidate.completion || "")
+    : "";
+
+  const ghostPrefixText = isQuestionMode
+    ? originalPrompt.substring(0, originalPrompt.indexOf('?'))
+    : originalPrompt;
+
+  const activePredictionCategory = activeCandidate
+    ? ('category' in activeCandidate ? activeCandidate.category : 'Inteligentní doplnění')
+    : 'Inteligentní doplnění';
+
+  // Apply active ghost prediction (triggered by Tab key or Accept button)
+  const handleApplyActivePrediction = (customIndex?: number) => {
+    const list = isQuestionMode ? questionPredictions : predictions;
+    const indexToUse = customIndex !== undefined ? customIndex : activePredictionIndex;
+    if (list.length === 0) return;
+
+    const candidate = list[indexToUse % list.length];
+    if (!candidate) return;
+
+    setPredictionUndoStack(prev => [...prev, originalPrompt]);
+    setPredictionRedoStack([]);
+
+    let newPrompt = "";
+    if (isQuestionMode && 'fullTextPreview' in candidate) {
+      newPrompt = (candidate as QuestionMarkPredictionCandidate).fullTextPreview;
+    } else if ('phrase' in candidate) {
+      newPrompt = (candidate as PredictionCandidate).phrase;
     } else {
-      setCommaPredictions(null);
-      setIsCommaPredicting(false);
+      newPrompt = ghostPrefixText + candidate.completion;
+    }
+
+    setOriginalPrompt(newPrompt);
+    setActivePredictionIndex(0);
+    showToast("Doplnění potvrdil [Tab ↹] — kód ztmavl a aktivoval se!");
+    triggerICloudSync();
+  };
+
+  // Apply just the next 1-2 words from active ghost completion
+  const handleApplyNextWordPrediction = () => {
+    if (!activeGhostCompletion) return;
+
+    setPredictionUndoStack(prev => [...prev, originalPrompt]);
+    setPredictionRedoStack([]);
+
+    const startsWithSpace = activeGhostCompletion.startsWith(" ");
+    const prefixSpace = startsWithSpace ? " " : "";
+    const tokens = activeGhostCompletion.trim().split(/\s+/).filter(Boolean);
+
+    if (tokens.length === 0) return;
+
+    // Take first 1 or 2 tokens if the first token is short
+    let wordCount = 1;
+    if (tokens.length > 1 && tokens[0].length <= 2) {
+      wordCount = 2;
+    }
+
+    const nextWordChunk = prefixSpace + tokens.slice(0, wordCount).join(" ");
+    const newPrompt = originalPrompt + nextWordChunk;
+
+    setOriginalPrompt(newPrompt);
+    setActivePredictionIndex(0);
+    showToast(`Přidáno slovo po slovu: "${nextWordChunk.trim()}"`);
+    triggerICloudSync();
+  };
+
+  // Cycle to next prediction variant
+  const cycleNextPredictionVariant = () => {
+    const total = currentPredictionList.length;
+    if (total <= 1) return;
+    setActivePredictionIndex(prev => (prev + 1) % total);
+  };
+
+  // Trigger question mark predictions when ? is present in originalPrompt
+  useEffect(() => {
+    if (originalPrompt && originalPrompt.includes('?')) {
+      const preds = getQuestionMarkPredictions(originalPrompt);
+      setQuestionPredictions(preds);
+    } else {
+      setQuestionPredictions([]);
     }
   }, [originalPrompt]);
 
-  const applyCommaSuggestion = (suggestion: string) => {
-    setOriginalPrompt(prev => {
-      const lastCommaIndex = prev.lastIndexOf(',');
-      if (lastCommaIndex !== -1) {
-        const base = prev.substring(0, lastCommaIndex + 1);
-        return base + " " + suggestion;
-      }
-      return prev + (prev.endsWith(" ") ? "" : " ") + suggestion;
-    });
-    setCommaPredictions(null);
+  // Apply chosen question prediction
+  const handleApplyQuestionPrediction = (candidate: QuestionMarkPredictionCandidate) => {
+    setPredictionUndoStack(prev => [...prev, originalPrompt]);
+    setPredictionRedoStack([]);
+    setOriginalPrompt(candidate.fullTextPreview);
+    setQuestionPredictions([]);
+    showToast("Predikce byla vložena a otazník byl automaticky odstraněn!");
+    triggerICloudSync();
+  };
+
+  // Undo last applied prediction
+  const handleUndoPrediction = () => {
+    if (predictionUndoStack.length === 0) return;
+    const previous = predictionUndoStack[predictionUndoStack.length - 1];
+    setPredictionUndoStack(prev => prev.slice(0, -1));
+    setPredictionRedoStack(prev => [...prev, originalPrompt]);
+    setOriginalPrompt(previous);
+    showToast("Aplikování predikce bylo vráceno zpět.");
+  };
+
+  // Redo undone prediction
+  const handleRedoPrediction = () => {
+    if (predictionRedoStack.length === 0) return;
+    const next = predictionRedoStack[predictionRedoStack.length - 1];
+    setPredictionRedoStack(prev => prev.slice(0, -1));
+    setPredictionUndoStack(prev => [...prev, originalPrompt]);
+    setOriginalPrompt(next);
+    showToast("Predikce byla znovu aplikována.");
   };
 
   // Simulate downloading the small 2.4 MB on-device neural prediction module
@@ -468,11 +567,37 @@ export default function App() {
     triggerICloudSync();
   };
 
-  // Capture tab or right arrow to apply autocomplete
+  // Capture Tab or Right Arrow to apply autocomplete, and Alt+Right to cycle variants
   const handlePromptKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Tab" && predictions.length > 0 && isPredictionModelDownloaded) {
+    // Ctrl/Cmd + ArrowRight accepts +1 word from active ghost completion
+    if ((e.ctrlKey || e.metaKey) && e.key === "ArrowRight" && activeGhostCompletion) {
       e.preventDefault();
-      applyPrediction(predictions[0]);
+      handleApplyNextWordPrediction();
+      return;
+    }
+
+    // Tab key confirms ghost completion
+    if (e.key === "Tab" && activeGhostCompletion) {
+      e.preventDefault();
+      handleApplyActivePrediction();
+      return;
+    }
+
+    // Right Arrow at end of text confirms ghost completion
+    if (e.key === "ArrowRight" && activeGhostCompletion) {
+      const target = e.currentTarget;
+      if (target.selectionStart === originalPrompt.length && target.selectionEnd === originalPrompt.length) {
+        e.preventDefault();
+        handleApplyActivePrediction();
+        return;
+      }
+    }
+
+    // Alt + Right or Alt + Down or Ctrl + Space cycles variant
+    if ((e.altKey && (e.key === "ArrowRight" || e.key === "ArrowDown")) || (e.ctrlKey && e.code === "Space")) {
+      e.preventDefault();
+      cycleNextPredictionVariant();
+      return;
     }
   };
 
@@ -923,43 +1048,132 @@ export default function App() {
     <div className="min-h-screen bg-[#030712] py-6 px-4 flex flex-col items-center justify-start text-[#e5e7eb] font-sans antialiased selection:bg-blue-600/30">
       
       {/* Upper Settings & Control Bar */}
-      <div className="w-full max-w-lg mb-4 flex items-center justify-between text-xs px-2 text-slate-400">
+      <div className={`w-full transition-all duration-300 ${
+        deviceView === 'mobile' ? 'max-w-[420px]' : deviceView === 'tablet' ? 'max-w-[768px]' : 'max-w-[1240px]'
+      } mb-4 flex items-center justify-between text-xs px-2 text-slate-400 flex-wrap gap-2`}>
+        
+        {/* Viewport Switcher (Mobil / Tablet / PC View) */}
+        <div className="flex items-center gap-1 bg-slate-900/90 p-1 rounded-2xl border border-slate-800/80 shadow-lg">
+          <button 
+            type="button"
+            onClick={() => {
+              setDeviceView('mobile');
+              showToast("Přepnuto na Mobilní zobrazení (412px)");
+            }}
+            id="viewport-mobile-btn"
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[11px] font-mono font-bold transition-all cursor-pointer ${
+              deviceView === 'mobile' 
+                ? "bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20" 
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+            title="Mobilní zobrazení (412px)"
+          >
+            <Smartphone className="w-3.5 h-3.5" />
+            <span>Mobil</span>
+          </button>
+
+          <button 
+            type="button"
+            onClick={() => {
+              setDeviceView('tablet');
+              showToast("Přepnuto na Tablet zobrazení (768px)");
+            }}
+            id="viewport-tablet-btn"
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[11px] font-mono font-bold transition-all cursor-pointer ${
+              deviceView === 'tablet' 
+                ? "bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20" 
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+            title="Tablet zobrazení (768px)"
+          >
+            <Tablet className="w-3.5 h-3.5" />
+            <span>Tablet</span>
+          </button>
+
+          <button 
+            type="button"
+            onClick={() => {
+              setDeviceView('pc');
+              showToast("Přepnuto na PC / Desktop zobrazení (1240px)");
+            }}
+            id="viewport-pc-btn"
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[11px] font-mono font-bold transition-all cursor-pointer ${
+              deviceView === 'pc' 
+                ? "bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20" 
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+            title="PC / Desktop zobrazení (1240px)"
+          >
+            <Monitor className="w-3.5 h-3.5" />
+            <span>PC View</span>
+          </button>
+        </div>
+
         <div className="flex items-center gap-2">
+          {/* Frame Toggle */}
           <button 
             onClick={() => setUseDeviceFrame(!useDeviceFrame)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full transition-all border ${
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full transition-all border text-[11px] font-mono cursor-pointer ${
               useDeviceFrame 
                 ? "bg-slate-900 text-cyan-400 border-cyan-500/30 shadow-md font-semibold" 
                 : "bg-transparent text-slate-500 border-slate-800"
             }`}
+            title="Zapnout/Vypnout simulaci hardwarového rámečku"
           >
-            <Smartphone className="w-3.5 h-3.5" />
-            <span>Futuristic Device Shell</span>
+            <span className={`w-2 h-2 rounded-full ${useDeviceFrame ? "bg-cyan-400 animate-pulse" : "bg-slate-600"}`}></span>
+            <span>Rámeček: {useDeviceFrame ? "ZAP" : "VYP"}</span>
           </button>
-        </div>
 
-        {/* Sync Indicator */}
-        <div className="flex items-center gap-1.5 bg-slate-900/80 px-3 py-1.5 rounded-full border border-slate-800/80 shadow-md">
-          <Cloud className={`w-3.5 h-3.5 text-cyan-400 ${iCloudSyncing ? "animate-bounce" : ""}`} />
-          <span className="font-semibold text-[10px] text-slate-300">
-            {iCloudSyncing ? "iCloud Synchronizing..." : "iCloud Live"}
-          </span>
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+          {/* Sync Indicator */}
+          <div className="flex items-center gap-1.5 bg-slate-900/80 px-3 py-1.5 rounded-full border border-slate-800/80 shadow-md">
+            <Cloud className={`w-3.5 h-3.5 text-cyan-400 ${iCloudSyncing ? "animate-bounce" : ""}`} />
+            <span className="font-semibold text-[10px] text-slate-300 hidden sm:inline">
+              {iCloudSyncing ? "iCloud Syncing..." : "iCloud Live"}
+            </span>
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+          </div>
         </div>
       </div>
 
       {/* Frame Container */}
-      <div className={`transition-all duration-300 w-full ${useDeviceFrame ? "max-w-[412px] rounded-[52px] border-[12px] border-slate-800 bg-[#080d1a] shadow-2xl relative overflow-hidden h-[860px] border-t-slate-700 border-b-slate-900" : "max-w-lg min-h-[820px] rounded-3xl bg-[#080d1a] border border-slate-800 shadow-2xl relative overflow-hidden"}`}>
+      <div className={`transition-all duration-300 w-full ${
+        deviceView === 'mobile'
+          ? (useDeviceFrame ? "max-w-[420px] rounded-[52px] border-[12px] border-slate-800 bg-[#080d1a] shadow-2xl relative overflow-hidden h-[860px] border-t-slate-700 border-b-slate-900" : "max-w-lg min-h-[820px] rounded-3xl bg-[#080d1a] border border-slate-800 shadow-2xl relative overflow-hidden h-[860px]")
+          : deviceView === 'tablet'
+          ? (useDeviceFrame ? "max-w-[768px] rounded-[36px] border-[10px] border-slate-800 bg-[#080d1a] shadow-2xl relative overflow-hidden h-[880px] border-t-slate-700 border-b-slate-900" : "max-w-[768px] min-h-[850px] rounded-3xl bg-[#080d1a] border border-slate-800 shadow-2xl relative overflow-hidden h-[880px]")
+          : (useDeviceFrame ? "max-w-[1240px] rounded-[24px] border-[8px] border-slate-800 bg-[#080d1a] shadow-2xl relative overflow-hidden h-[900px] border-t-slate-700 border-b-slate-900" : "max-w-[1240px] min-h-[860px] rounded-2xl bg-[#080d1a] border border-slate-800 shadow-2xl relative overflow-hidden h-[900px]")
+      }`}>
         
-        {/* iOS High-Tech Status Bar */}
-        <div className="bg-[#080d1a] h-12 pt-4 px-6 flex items-center justify-between select-none relative z-20 border-b border-slate-900/40">
-          <span className="text-[14px] font-semibold text-slate-200 tracking-tight font-mono">{currentTime || "9:41 AM"}</span>
+        {/* iOS / Workstation High-Tech Status Bar */}
+        <div className="bg-[#080d1a] h-12 pt-1 px-6 flex items-center justify-between select-none relative z-20 border-b border-slate-900/40">
+          {deviceView === 'pc' ? (
+            /* PC Desktop Titlebar with dots */
+            <div className="flex items-center gap-2">
+              <span className="w-3 h-3 rounded-full bg-rose-500/80 border border-rose-600/50 inline-block"></span>
+              <span className="w-3 h-3 rounded-full bg-amber-500/80 border border-amber-600/50 inline-block"></span>
+              <span className="w-3 h-3 rounded-full bg-emerald-500/80 border border-emerald-600/50 inline-block"></span>
+              <span className="text-[10px] text-slate-400 ml-2 font-mono hidden sm:inline">
+                https://prompt-architect.ai/studio (1240×900 Workstation)
+              </span>
+            </div>
+          ) : (
+            <span className="text-[14px] font-semibold text-slate-200 tracking-tight font-mono">
+              {currentTime || "9:41 AM"}
+            </span>
+          )}
           
-          {/* iOS Dynamic Island / Tech Notch */}
-          {useDeviceFrame && (
+          {/* iOS Dynamic Island / Tech Notch for Mobile */}
+          {useDeviceFrame && deviceView === 'mobile' && (
             <div className="absolute left-1/2 transform -translate-x-1/2 top-3 w-[115px] h-[28px] bg-black rounded-full flex items-center justify-end px-3 border border-slate-800">
               <span className="w-1.5 h-1.5 rounded-full bg-cyan-900 border border-cyan-500 mr-1 animate-pulse"></span>
               <span className="w-2.5 h-2.5 rounded-full bg-slate-950"></span>
+            </div>
+          )}
+
+          {/* Tablet Front Lens Camera */}
+          {useDeviceFrame && deviceView === 'tablet' && (
+            <div className="absolute left-1/2 transform -translate-x-1/2 top-3 w-[14px] h-[14px] bg-black rounded-full flex items-center justify-center border border-slate-800">
+              <span className="w-1.5 h-1.5 rounded-full bg-cyan-950 border border-cyan-500/60 animate-pulse"></span>
             </div>
           )}
 
@@ -1013,11 +1227,19 @@ export default function App() {
           
           <div>
             {/* Header Branding */}
-            <div className="mt-2 mb-4 px-1 flex items-center justify-between">
-              <div>
+            <div className="mt-2 mb-4 px-1 flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center gap-3">
                 <h1 className="text-2xl font-bold tracking-tight text-white mt-0.5">
                   Prompt Architect
                 </h1>
+                <span className="text-[10px] font-mono font-bold px-2.5 py-1 rounded-full bg-slate-900 border border-slate-800 text-cyan-400 flex items-center gap-1.5 shadow-sm">
+                  {deviceView === 'mobile' && <Smartphone className="w-3 h-3 text-cyan-400" />}
+                  {deviceView === 'tablet' && <Tablet className="w-3 h-3 text-cyan-400" />}
+                  {deviceView === 'pc' && <Monitor className="w-3 h-3 text-cyan-400" />}
+                  <span className="uppercase tracking-wider">
+                    {deviceView === 'mobile' ? 'Mobile View' : deviceView === 'tablet' ? 'Tablet View' : 'PC Desktop View'}
+                  </span>
+                </span>
               </div>
             </div>
 
@@ -1056,21 +1278,31 @@ export default function App() {
                 </div>
               </div>
               
-              <div className="relative">
-                {/* Background overlay for Ghost Auto-completion suggestion (Gmail style) */}
-                {isPredictionModelDownloaded && predictions.length > 0 && originalPrompt.trim().length >= 2 && (
-                  <div className="absolute top-0 left-0 right-0 bottom-0 p-3.5 pr-10 text-sm font-medium font-sans text-slate-600 pointer-events-none select-none whitespace-pre-wrap leading-normal">
-                    <span className="opacity-0">{originalPrompt}</span>
-                    <span>{predictions[0].completion}</span>
+              <div className="relative group">
+                {/* Google AI Studio Inline Ghost Text Overlay */}
+                {activeGhostCompletion && (
+                  <div 
+                    className="absolute top-0 left-0 right-0 bottom-0 p-3.5 pr-20 text-sm font-medium font-sans leading-relaxed whitespace-pre-wrap break-words pointer-events-none select-none overflow-hidden z-0"
+                    aria-hidden="true"
+                  >
+                    {/* Typed user text rendered transparently so character width & line wrap matches 1:1 */}
+                    <span className="opacity-0 text-transparent select-none">{ghostPrefixText}</span>
+                    {/* Ghost completion text rendered in dimmed/faded cyan style */}
+                    <span className="text-cyan-400/60 font-medium italic select-none bg-cyan-950/20 px-0.5 rounded border border-cyan-800/30 animate-pulse">
+                      {activeGhostCompletion}
+                    </span>
                   </div>
                 )}
 
                 <textarea
                   value={originalPrompt}
-                  onChange={(e) => setOriginalPrompt(e.target.value)}
+                  onChange={(e) => {
+                    setOriginalPrompt(e.target.value);
+                    setActivePredictionIndex(0);
+                  }}
                   onKeyDown={handlePromptKeyDown}
-                  placeholder="e.g. Vytvořit moderní SwiftUI, Create a high-converting SaaS..."
-                  className="w-full text-sm bg-slate-950/80 border border-slate-800 rounded-2xl p-3.5 pr-20 focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-hidden min-h-[85px] resize-none font-medium text-slate-100 placeholder-slate-500 relative z-10 bg-transparent"
+                  placeholder="Napište instrukci (např. Vytvořit moderní SwiftUI, Napiš skript...) nebo zkusťe ?"
+                  className="w-full text-sm bg-transparent border border-slate-800 focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-hidden min-h-[90px] resize-none font-medium text-slate-100 placeholder-slate-500 relative z-10 leading-relaxed font-sans shadow-inner"
                 />
                 
                 {/* Floating Action Buttons inside input container */}
@@ -1123,6 +1355,122 @@ export default function App() {
                 </div>
               )}
 
+              {/* Google AI Studio Autocomplete Control Bar */}
+              {activeGhostCompletion ? (
+                <div className="mt-2.5 bg-slate-950/90 border border-cyan-500/40 rounded-2xl p-3 shadow-xl backdrop-blur-md animate-in fade-in slide-in-from-top-1 duration-200" id="aistudio-ghost-bar">
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5">
+                    {/* Primary Accept Action */}
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() => handleApplyActivePrediction()}
+                        id="accept-ghost-prediction-btn"
+                        className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-gradient-to-r from-cyan-500 via-teal-400 to-emerald-400 text-slate-950 font-bold font-sans text-xs hover:brightness-110 active:scale-95 transition-all shadow-md shadow-cyan-500/20 cursor-pointer"
+                      >
+                        <span className="bg-slate-950/30 px-1.5 py-0.5 rounded-md text-[10px] font-mono border border-slate-950/20">Tab ↹</span>
+                        <span>Potvrdit ({activePredictionCategory})</span>
+                      </button>
+
+                      {/* Incremental Word-by-Word Button */}
+                      <button
+                        type="button"
+                        onClick={handleApplyNextWordPrediction}
+                        id="accept-next-word-btn"
+                        className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-cyan-500/30 text-cyan-300 font-semibold font-sans text-xs hover:border-cyan-400 active:scale-95 transition-all shadow-xs cursor-pointer"
+                        title="Vložit pouze 1-2 další slova z nápovědy (Ctrl + →)"
+                      >
+                        <span className="bg-slate-950 px-1.5 py-0.5 rounded text-[9px] font-mono text-cyan-400 border border-slate-800">Ctrl + →</span>
+                        <span>+1 Slovo po slovu</span>
+                      </button>
+
+                      {/* Variant Cycle Controls */}
+                      {currentPredictionList.length > 1 && (
+                        <div className="flex items-center gap-1 bg-slate-900/90 px-2.5 py-1 rounded-xl border border-slate-800 text-[10px] font-mono text-slate-300">
+                          <span className="text-slate-400">Varianta:</span>
+                          <span className="font-bold text-cyan-400 font-mono">{activePredictionIndex + 1} / {currentPredictionList.length}</span>
+                          <button
+                            type="button"
+                            onClick={cycleNextPredictionVariant}
+                            className="ml-1 p-0.5 hover:bg-slate-800 rounded text-cyan-400 hover:text-white transition-colors cursor-pointer"
+                            title="Další varianta (Alt + →)"
+                          >
+                            <ChevronRight className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Helper info & Undo */}
+                    <div className="flex items-center gap-2.5 text-[10px] font-mono text-slate-400 w-full sm:w-auto justify-between sm:justify-end border-t sm:border-t-0 border-slate-900 pt-2 sm:pt-0">
+                      <span className="flex items-center gap-1 text-slate-400">
+                        <Sparkles className="w-3 h-3 text-cyan-400" />
+                        <span>Stiskněte <strong className="text-slate-200">[Tab]</strong> pro potvrdit nebo <strong className="text-slate-200">[Ctrl + →]</strong> po slovech</span>
+                      </span>
+
+                      {predictionUndoStack.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleUndoPrediction}
+                          className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 text-[9px] font-mono transition-colors cursor-pointer"
+                          title="Vrátit zpět (Ctrl+Z)"
+                        >
+                          <Undo2 className="w-3 h-3 text-cyan-400" />
+                          <span>Zpět ({predictionUndoStack.length})</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Variant Quick Option Chips */}
+                  {currentPredictionList.length > 1 && (
+                    <div className="mt-2.5 pt-2 border-t border-slate-900/80 flex items-center gap-2 overflow-x-auto no-scrollbar">
+                      <span className="text-[9px] font-mono font-bold text-slate-500 uppercase tracking-wider shrink-0">
+                        Možné varianty:
+                      </span>
+                      {currentPredictionList.map((cand, idx) => {
+                        const isSelected = (activePredictionIndex % currentPredictionList.length) === idx;
+                        const cat = 'category' in cand ? cand.category : 'Nápověda';
+                        return (
+                          <button
+                            key={idx}
+                            type="button"
+                            onClick={() => {
+                              setActivePredictionIndex(idx);
+                            }}
+                            className={`px-2.5 py-1 rounded-lg text-[10px] font-sans font-medium transition-all cursor-pointer shrink-0 border flex items-center gap-1.5 ${
+                              isSelected
+                                ? "bg-cyan-950/80 border-cyan-500/60 text-cyan-200 font-semibold shadow-xs"
+                                : "bg-slate-900/60 border-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-850"
+                            }`}
+                          >
+                            <span className={`w-1.5 h-1.5 rounded-full ${isSelected ? 'bg-cyan-400 animate-ping' : 'bg-slate-600'}`}></span>
+                            <span>{cat}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                /* Undo bar if predictions were previously applied */
+                predictionUndoStack.length > 0 && (
+                  <div className="mt-2.5 flex items-center justify-between px-3.5 py-2 rounded-xl bg-slate-950/80 border border-slate-800 text-[10px] font-mono text-slate-400">
+                    <span className="flex items-center gap-1.5 text-slate-300">
+                      <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
+                      Doplnění ztmavlo a aktivovalo se v textu ({predictionUndoStack.length} {predictionUndoStack.length === 1 ? 'změna' : 'změn'})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleUndoPrediction}
+                      className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 text-[9px] font-mono transition-all cursor-pointer active:scale-95"
+                    >
+                      <Undo2 className="w-3.5 h-3.5 text-cyan-400" />
+                      <span>Vrátit doplnění zpět</span>
+                    </button>
+                  </div>
+                )
+              )}
+
               {/* Real-time Structural Richness Gauge Details Strip */}
               <div className="mt-2 bg-slate-950/60 border border-slate-900 rounded-xl p-2 flex items-center justify-between text-[10px] font-mono flex-wrap gap-1.5" id="complexity-gauge-details-strip">
                 <div className="flex items-center gap-2.5">
@@ -1154,41 +1502,6 @@ export default function App() {
                   <span className={`px-1.5 py-0.5 rounded border transition-colors ${/\{\{.*?\}\}|\[.*?\]/.test(originalPrompt) ? 'bg-cyan-950/80 text-cyan-300 border-cyan-800/50 font-bold' : 'bg-slate-900/60 border-slate-850'}`}>&#123;&#123;Proměnná&#125;&#125;</span>
                 </div>
               </div>
-
-              {/* Suggestions Overlay */}
-              {isPredictionModelDownloaded && predictions.length > 0 && originalPrompt.trim().length >= 2 && (
-                <div className="mt-2 space-y-1 bg-slate-950/90 border border-cyan-500/20 rounded-xl p-2 shadow-xl animate-in fade-in slide-in-from-top-1 duration-200">
-                  <div className="flex items-center justify-between px-1.5 pb-1 text-[9px] text-slate-400 border-b border-slate-900">
-                    <span className="font-bold flex items-center gap-1 font-mono">
-                      <Terminal className="w-3 h-3 text-cyan-400" />
-                      NeuralPredict Mini ({predictions[0].confidence}% Confidence)
-                    </span>
-                    <span className="font-mono text-[8px] text-slate-500 bg-slate-900 px-1.5 py-0.2 rounded-md">Tab key / click</span>
-                  </div>
-                  <div className="space-y-1 pt-1 max-h-[140px] overflow-y-auto no-scrollbar">
-                    {predictions.map((pred, idx) => (
-                      <button
-                        key={idx}
-                        type="button"
-                        onClick={() => applyPrediction(pred)}
-                        className="w-full text-left p-1.5 rounded-lg bg-slate-900/40 hover:bg-cyan-950/30 border border-slate-800/40 hover:border-cyan-500/30 transition-all flex items-center justify-between text-[11px] group"
-                      >
-                        <div className="flex flex-col pr-2 truncate">
-                          <span className="text-[8px] font-bold text-cyan-400 font-mono tracking-wider uppercase">
-                            {pred.category}
-                          </span>
-                          <span className="text-slate-300 group-hover:text-white transition-colors truncate">
-                            {pred.phrase}
-                          </span>
-                        </div>
-                        <span className="text-[9px] text-cyan-500 font-mono shrink-0 font-bold opacity-70 group-hover:opacity-100 pl-2">
-                          Apply →
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
 
               {/* Collapsible Model Core Selection & Predictor Panel (Roletka) */}
               <div className="mt-3 border-t border-slate-900/60 pt-3">
@@ -1351,95 +1664,7 @@ export default function App() {
               </AnimatePresence>
             </div>
 
-            {/* Inteligentní nápověda a predikce textu za čárkou */}
-            <div className="cyber-card rounded-2xl p-4 mb-4 border-slate-800 bg-[#070b13]/80 relative overflow-hidden" id="comma-prediction-panel">
-              {/* Decorative top ambient bar */}
-              <div className="absolute top-0 left-0 right-0 h-[1.5px] bg-gradient-to-r from-transparent via-cyan-500 to-transparent opacity-80" />
-              
-              <div className="flex items-center gap-2 mb-3">
-                <Brain className="w-4 h-4 text-cyan-400" />
-                <div>
-                  <h3 className="text-xs font-bold text-slate-200 uppercase font-mono tracking-wider">
-                    Inteligentní nápověda & Predikce textu
-                  </h3>
-                </div>
-              </div>
 
-              {isCommaPredicting ? (
-                <div className="py-4 flex flex-col items-center justify-center space-y-2.5">
-                  <div className="flex items-center gap-1">
-                    <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-bounce animate-duration-500" style={{ animationDelay: '0ms' }}></span>
-                    <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-bounce animate-duration-500" style={{ animationDelay: '150ms' }}></span>
-                    <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-bounce animate-duration-500" style={{ animationDelay: '300ms' }}></span>
-                  </div>
-                  <span className="text-[10px] font-mono text-cyan-400 animate-pulse tracking-wide">
-                    Zjišťuji pokračování věty za čárkou...
-                  </span>
-                </div>
-              ) : commaPredictions ? (
-                <div className="space-y-2 animate-in fade-in slide-in-from-top-1 duration-300">
-                  <span className="text-[9px] font-bold text-slate-400 uppercase font-mono block tracking-wider px-0.5">
-                    Vyberte pokračování pro vložení za čárku:
-                  </span>
-                  
-                  <div className="grid grid-cols-1 gap-2">
-                    {/* Option 1: Relevant */}
-                    <button
-                      type="button"
-                      onClick={() => applyCommaSuggestion(commaPredictions.relevant)}
-                      className="w-full text-left p-2.5 rounded-xl bg-slate-900/60 hover:bg-emerald-950/20 border border-slate-800 hover:border-emerald-500/40 transition-all cursor-pointer group flex items-start gap-2.5"
-                    >
-                      <span className="shrink-0 text-[8px] font-bold text-emerald-400 bg-emerald-950/50 px-1.5 py-0.5 rounded-md border border-emerald-900/30 uppercase font-mono mt-0.5">
-                        Relevantní
-                      </span>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-xs text-slate-300 group-hover:text-emerald-300 transition-colors leading-relaxed">
-                          {commaPredictions.relevant}
-                        </p>
-                      </div>
-                    </button>
-
-                    {/* Option 2: Inspiring */}
-                    <button
-                      type="button"
-                      onClick={() => applyCommaSuggestion(commaPredictions.inspiring)}
-                      className="w-full text-left p-2.5 rounded-xl bg-slate-900/60 hover:bg-cyan-950/20 border border-slate-800 hover:border-cyan-500/40 transition-all cursor-pointer group flex items-start gap-2.5"
-                    >
-                      <span className="shrink-0 text-[8px] font-bold text-cyan-400 bg-cyan-950/50 px-1.5 py-0.5 rounded-md border border-cyan-900/30 uppercase font-mono mt-0.5">
-                        Inspirativní
-                      </span>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-xs text-slate-300 group-hover:text-cyan-300 transition-colors leading-relaxed">
-                          {commaPredictions.inspiring}
-                        </p>
-                      </div>
-                    </button>
-
-                    {/* Option 3: Unusual */}
-                    <button
-                      type="button"
-                      onClick={() => applyCommaSuggestion(commaPredictions.unusual)}
-                      className="w-full text-left p-2.5 rounded-xl bg-slate-900/60 hover:bg-purple-950/20 border border-slate-800 hover:border-purple-500/40 transition-all cursor-pointer group flex items-start gap-2.5"
-                    >
-                      <span className="shrink-0 text-[8px] font-bold text-purple-400 bg-purple-950/50 px-1.5 py-0.5 rounded-md border border-purple-900/30 uppercase font-mono mt-0.5">
-                        Neobvyklé
-                      </span>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-xs text-slate-300 group-hover:text-purple-300 transition-colors leading-relaxed">
-                          {commaPredictions.unusual}
-                        </p>
-                      </div>
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-900 text-center">
-                  <p className="text-[10px] text-slate-400 leading-relaxed font-sans">
-                    💡 <span className="font-semibold text-slate-300">Tip pro predikci:</span> Napište do promptu <span className="text-cyan-400 font-mono font-bold">čárku ( , )</span> a přestaňte psát. Systém automaticky zanalyzuje kontext a nabídne vám tři různé směry rozvoje.
-                  </p>
-                </div>
-              )}
-            </div>
 
             {/* Quick Starter Templates - Collapsible Roletka */}
             {originalPrompt === "" && questions.length === 0 && (
