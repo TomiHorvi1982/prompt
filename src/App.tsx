@@ -53,7 +53,7 @@ import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianG
 import { OptimizationHistoryChart } from "./components/OptimizationHistoryChart";
 import DeepAnalysisView from "./components/DeepAnalysisView";
 
-import { Question, CatalogPrompt, Citation, SynthesizedPrompt, SavedPromptSession, LocalEngine, OptimizationStep, CriticReview, QuestionMarkPredictionCandidate } from "./types";
+import { Question, CatalogPrompt, Citation, SynthesizedPrompt, SavedPromptSession, LocalEngine, OptimizationStep, CriticReview, QuestionMarkPredictionCandidate, OutputProvenance, FallbackReason } from "./types";
 import { AESTHETIC_PRESETS, STARTER_TEMPLATES } from "./data";
 import { 
   localGenerateQuestions, 
@@ -66,6 +66,46 @@ import {
   calculateComplexity,
   getQuestionMarkPredictions
 } from "./lib/localModel";
+
+// Tells the user where a block of content came from. Local results were previously
+// indistinguishable from model output, so a canned answer could be read as a real one.
+function ProvenanceBadge({ provenance }: { provenance: OutputProvenance | null }) {
+  if (!provenance || provenance.origin === "cloud") return null;
+
+  const reasonText: Record<FallbackReason, string> = {
+    "missing-api-key": "není nastavený API klíč",
+    "quota-exhausted": "vyčerpaná kvóta API",
+    "api-error": "chyba API",
+    "server-error": "chyba serveru",
+    "network-error": "server nedostupný"
+  };
+
+  const isChosen = provenance.origin === "offline-mode";
+  const detail = provenance.reason ? reasonText[provenance.reason] : "";
+
+  return (
+    <div
+      className={`flex items-start gap-1.5 px-2.5 py-1.5 rounded-xl border text-[10px] font-mono leading-relaxed ${
+        isChosen
+          ? "bg-slate-900/60 border-slate-700/60 text-slate-300"
+          : "bg-amber-950/40 border-amber-700/50 text-amber-300"
+      }`}
+    >
+      {isChosen
+        ? <Cpu className="w-3.5 h-3.5 shrink-0 mt-px text-slate-400" />
+        : <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px text-amber-400" />}
+      <span>
+        <strong className="font-bold">
+          {isChosen ? "Lokální engine" : "Nouzová lokální šablona"}
+        </strong>
+        {" — "}
+        {isChosen
+          ? "výstup vytvořilo zařízení, ne jazykový model."
+          : `model neodpověděl (${detail}), zobrazen předpřipravený text. Nejde o výstup AI.`}
+      </span>
+    </div>
+  );
+}
 
 export default function App() {
   // Device Frame & Viewport State (Mobile, Tablet, PC)
@@ -84,6 +124,18 @@ export default function App() {
   const liveWordCount = useMemo(() => originalPrompt.trim().split(/\s+/).filter(Boolean).length, [originalPrompt]);
   const liveCharCount = originalPrompt.length;
   const [currentPillar, setCurrentPillar] = useState<1 | 2 | 3>(1);
+
+  // Where each block of generated content actually came from (model vs. local engine).
+  const [questionsProvenance, setQuestionsProvenance] = useState<OutputProvenance | null>(null);
+  const [catalogProvenance, setCatalogProvenance] = useState<OutputProvenance | null>(null);
+  const [synthesisProvenance, setSynthesisProvenance] = useState<OutputProvenance | null>(null);
+  const [criticProvenance, setCriticProvenance] = useState<OutputProvenance | null>(null);
+
+  // Reads the server's honest self-report off a response body.
+  const provenanceFrom = (data: any): OutputProvenance =>
+    data?.isOfflineFallback
+      ? { origin: "fallback", reason: data?.fallbackReason ?? "api-error" }
+      : { origin: "cloud" };
 
   // Pillar 1: Context Questions
   const [questions, setQuestions] = useState<Question[]>([]);
@@ -234,6 +286,38 @@ export default function App() {
   // Web Speech API Voice-to-Text state
   const [isListening, setIsListening] = useState(false);
   const recognitionRef = React.useRef<any>(null);
+  // Text already in the field when dictation started; dictated speech is appended to it.
+  const dictationBaseRef = React.useRef("");
+  // Finalized speech segments accumulated across onresult events. The API only reports
+  // the newest segments from event.resultIndex on, so earlier ones must be kept here or
+  // every new phrase would replace the previous one.
+  const dictationFinalRef = React.useRef("");
+
+  // Called when the user edits the field by hand while dictation is running, so the
+  // typed text becomes the new base instead of being overwritten by the next segment.
+  const rebaseDictation = (typedValue: string) => {
+    if (!isListening) return;
+    dictationBaseRef.current = typedValue;
+    dictationFinalRef.current = "";
+  };
+
+  // Stop recognition and release the handle. Safe to call when nothing is running.
+  const stopRecognition = () => {
+    const recognition = recognitionRef.current;
+    if (!recognition) return;
+    recognition.onresult = null;
+    recognition.onerror = null;
+    recognition.onend = null;
+    try {
+      recognition.stop();
+    } catch {
+      // already stopped
+    }
+    recognitionRef.current = null;
+  };
+
+  // Recognition keeps the microphone open, so it must not outlive the component.
+  useEffect(() => stopRecognition, []);
 
   const toggleListening = () => {
     const windowObj = window as any;
@@ -245,13 +329,7 @@ export default function App() {
     }
 
     if (isListening) {
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.stop();
-        } catch {
-          // ignore
-        }
-      }
+      stopRecognition();
       setIsListening(false);
       showToast("Hlasové zadávání pozastaveno.");
       return;
@@ -263,7 +341,8 @@ export default function App() {
       recognition.interimResults = true;
       recognition.lang = navigator.language || "cs-CZ";
 
-      let baseText = originalPrompt;
+      dictationBaseRef.current = originalPrompt;
+      dictationFinalRef.current = "";
 
       recognition.onstart = () => {
         setIsListening(true);
@@ -271,14 +350,25 @@ export default function App() {
       };
 
       recognition.onresult = (event: any) => {
-        let transcript = "";
+        // Finalized segments are committed once and kept; interim ones are rebuilt on
+        // every event, since the engine keeps revising them until they are finalized.
+        let interim = "";
         for (let i = event.resultIndex; i < event.results.length; i++) {
-          transcript += event.results[i][0].transcript;
+          const result = event.results[i];
+          const text = result[0]?.transcript ?? "";
+          if (result.isFinal) {
+            dictationFinalRef.current += text;
+          } else {
+            interim += text;
+          }
         }
-        if (transcript) {
-          const spacing = baseText && !baseText.endsWith(" ") ? " " : "";
-          setOriginalPrompt(baseText + spacing + transcript);
-        }
+
+        const base = dictationBaseRef.current;
+        const spoken = dictationFinalRef.current + interim;
+        if (!spoken) return;
+
+        const spacing = base && !base.endsWith(" ") && !spoken.startsWith(" ") ? " " : "";
+        setOriginalPrompt(base + spacing + spoken);
       };
 
       recognition.onerror = (event: any) => {
@@ -293,6 +383,7 @@ export default function App() {
 
       recognition.onend = () => {
         setIsListening(false);
+        recognitionRef.current = null;
       };
 
       recognitionRef.current = recognition;
@@ -347,6 +438,13 @@ export default function App() {
     ? originalPrompt.substring(0, originalPrompt.indexOf('?'))
     : originalPrompt;
 
+  // The inline overlay mirrors the textarea character for character, so it only lines up
+  // when the completion is appended at the very end. In question mode the completion goes
+  // where the "?" is, with the marker and any trailing text still in the field, so drawing
+  // an inline ghost there would put it visibly out of place. That case gets the preview
+  // panel below the field instead.
+  const inlineGhostCompletion = ghostPrefixText === originalPrompt ? activeGhostCompletion : "";
+
   const activePredictionCategory = activeCandidate
     ? ('category' in activeCandidate ? activeCandidate.category : 'Inteligentní doplnění')
     : 'Inteligentní doplnění';
@@ -378,9 +476,15 @@ export default function App() {
     triggerICloudSync();
   };
 
+  // Word-by-word acceptance only makes sense against a completion that continues the
+  // current text. Question-mode candidates are whole canned blocks re-derived from the
+  // text before the "?", so consuming one word and re-predicting repeats that word
+  // ("… v Reactu Napiš" → "… v Reactu Napiš Napiš kompletní …"). Offered only where it works.
+  const canAcceptWordByWord = !isQuestionMode && !!activeGhostCompletion;
+
   // Apply just the next 1-2 words from active ghost completion
   const handleApplyNextWordPrediction = () => {
-    if (!activeGhostCompletion) return;
+    if (!canAcceptWordByWord) return;
 
     setPredictionUndoStack(prev => [...prev, originalPrompt]);
     setPredictionRedoStack([]);
@@ -516,39 +620,76 @@ export default function App() {
     }, 1250);
   };
 
+  // Guards the persistence effect below: it must not run before the initial load has
+  // finished, or the first render's empty array would overwrite what is in storage.
+  // This is state rather than a ref on purpose — both effects run in the same commit,
+  // so a ref set by the loader would already read true in the writer, with the writer
+  // still closed over the empty array from that render.
+  const [sessionsHydrated, setSessionsHydrated] = useState(false);
+
+  // Coerces one stored entry into a usable session. Storage is user-writable and may
+  // hold entries from an older schema, so nothing here may assume a field exists.
+  const normalizeSession = (raw: any, index: number): SavedPromptSession => ({
+    id: String(raw?.id ?? `restored-${index}-${Date.now()}`),
+    title: String(raw?.title ?? "Untitled prompt"),
+    originalPrompt: String(raw?.originalPrompt ?? ""),
+    finalPrompt: String(raw?.finalPrompt ?? ""),
+    timestamp: String(raw?.timestamp ?? "Unknown"),
+    optimizationHistory: Array.isArray(raw?.optimizationHistory) ? raw.optimizationHistory : undefined
+  });
+
   // Load Saved Sessions from LocalStorage
   useEffect(() => {
-    const stored = localStorage.getItem("prompt_architect_sessions");
-    if (stored) {
-      setSavedSessions(JSON.parse(stored));
-    } else {
-      const sampleSessions: SavedPromptSession[] = [
-        {
-          id: "1",
-          title: "Neural Fitness Planner",
-          originalPrompt: "Create a personalized fitness planner for busy professionals.",
-          finalPrompt: "# ROLE & CONTEXT\nAdopt the persona of an elite AI Health Specialist...",
-          timestamp: "Yesterday, 4:20 PM"
-        },
-        {
-          id: "2",
-          title: "SaaS Conversational Engine",
-          originalPrompt: "Write compelling landing page copy.",
-          finalPrompt: "# ROLE: Expert AI Conversion Copywriter...",
-          timestamp: "2 days ago"
+    const sampleSessions: SavedPromptSession[] = [
+      {
+        id: "1",
+        title: "Neural Fitness Planner",
+        originalPrompt: "Create a personalized fitness planner for busy professionals.",
+        finalPrompt: "# ROLE & CONTEXT\nAdopt the persona of an elite AI Health Specialist...",
+        timestamp: "Yesterday, 4:20 PM"
+      },
+      {
+        id: "2",
+        title: "SaaS Conversational Engine",
+        originalPrompt: "Write compelling landing page copy.",
+        finalPrompt: "# ROLE: Expert AI Conversion Copywriter...",
+        timestamp: "2 days ago"
+      }
+    ];
+
+    // Storage can be unreadable (Safari private mode, disabled cookies) or hold data
+    // this build cannot parse. Neither may take the app down on mount.
+    try {
+      const stored = localStorage.getItem("prompt_architect_sessions");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed)) {
+          setSavedSessions(parsed.map(normalizeSession));
+        } else {
+          throw new Error("Stored sessions are not an array");
         }
-      ];
-      localStorage.setItem("prompt_architect_sessions", JSON.stringify(sampleSessions));
+      } else {
+        localStorage.setItem("prompt_architect_sessions", JSON.stringify(sampleSessions));
+        setSavedSessions(sampleSessions);
+      }
+    } catch (err) {
+      console.warn("Could not restore saved sessions, starting from defaults:", err);
       setSavedSessions(sampleSessions);
+    } finally {
+      setSessionsHydrated(true);
     }
   }, []);
 
-  // Trigger auto iCloud sync on sessions update
+  // Persist sessions on every change. Writing an empty array is intentional — it is
+  // how deleting the last session is recorded.
   useEffect(() => {
-    if (savedSessions.length > 0) {
+    if (!sessionsHydrated) return;
+    try {
       localStorage.setItem("prompt_architect_sessions", JSON.stringify(savedSessions));
+    } catch (err) {
+      console.warn("Could not persist saved sessions:", err);
     }
-  }, [savedSessions]);
+  }, [savedSessions, sessionsHydrated]);
 
   // Toast utility helper
   const [lastToast, setLastToast] = useState("");
@@ -570,7 +711,7 @@ export default function App() {
   // Capture Tab or Right Arrow to apply autocomplete, and Alt+Right to cycle variants
   const handlePromptKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Ctrl/Cmd + ArrowRight accepts +1 word from active ghost completion
-    if ((e.ctrlKey || e.metaKey) && e.key === "ArrowRight" && activeGhostCompletion) {
+    if ((e.ctrlKey || e.metaKey) && e.key === "ArrowRight" && canAcceptWordByWord) {
       e.preventDefault();
       handleApplyNextWordPrediction();
       return;
@@ -584,7 +725,10 @@ export default function App() {
     }
 
     // Right Arrow at end of text confirms ghost completion
-    if (e.key === "ArrowRight" && activeGhostCompletion) {
+    // Bare ArrowRight only. Without the modifier check this branch also swallowed
+    // Alt + ArrowRight (cycle variant) and Ctrl + ArrowRight whenever the caret sat at
+    // the end of the text, turning both into a full accept.
+    if (e.key === "ArrowRight" && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && activeGhostCompletion) {
       const target = e.currentTarget;
       if (target.selectionStart === originalPrompt.length && target.selectionEnd === originalPrompt.length) {
         e.preventDefault();
@@ -614,6 +758,14 @@ export default function App() {
     setSynthesized(null);
     setCurrentPillar(1);
 
+    // A new run must not inherit the previous run's citations, critique or provenance.
+    setCitations([]);
+    setCriticReview(null);
+    setQuestionsProvenance(null);
+    setCatalogProvenance(null);
+    setSynthesisProvenance(null);
+    setCriticProvenance(null);
+
     // Initialize Optimization History
     const initialStep: OptimizationStep = {
       stepIndex: 0,
@@ -635,10 +787,13 @@ export default function App() {
       setTimeout(() => {
         const localQs = localGenerateQuestions(promptToUse);
         setQuestions(localQs);
+        setQuestionsProvenance({ origin: "offline-mode" });
         setLoadingQuestions(false);
 
         const localCat = localSearchCatalog(promptToUse);
         setCatalog(localCat);
+        setCatalogProvenance({ origin: "offline-mode" });
+        setCitations([]);
         setLoadingCatalog(false);
         showToast("Initialized offline models");
       }, 750);
@@ -652,10 +807,12 @@ export default function App() {
         const qData = await qRes.json();
         if (qData.error) throw new Error(qData.error);
         setQuestions(qData.questions || []);
+        setQuestionsProvenance(provenanceFrom(qData));
       } catch (err: any) {
         console.warn("Backend error, falling back to local simulation:", err);
         const localQs = localGenerateQuestions(promptToUse);
         setQuestions(localQs);
+        setQuestionsProvenance({ origin: "fallback", reason: "network-error" });
       } finally {
         setLoadingQuestions(false);
       }
@@ -670,10 +827,13 @@ export default function App() {
         if (cData.error) throw new Error(cData.error);
         setCatalog(cData.catalog || []);
         setCitations(cData.citations || []);
+        setCatalogProvenance(provenanceFrom(cData));
       } catch (err: any) {
         console.warn("Backend catalog search error, using local simulation:", err);
         const localCat = localSearchCatalog(promptToUse);
         setCatalog(localCat);
+        setCitations([]);
+        setCatalogProvenance({ origin: "fallback", reason: "network-error" });
       } finally {
         setLoadingCatalog(false);
       }
@@ -751,6 +911,7 @@ export default function App() {
           ...response,
           explanation: enrichedExplanation
         });
+        setSynthesisProvenance({ origin: "offline-mode" });
         setSynthesizing(false);
         addOptimizationStep("Syntéza", response.finalPrompt);
         showToast(`Zpracováno lokálně modelem: ${engineName}!`);
@@ -774,6 +935,7 @@ export default function App() {
         const data = await response.json();
         if (data.error) throw new Error(data.error);
         setSynthesized(data);
+        setSynthesisProvenance(provenanceFrom(data));
         addOptimizationStep("Syntéza", data.finalPrompt);
         if (isReviewMode) {
           handleRunCritic(data.finalPrompt);
@@ -787,6 +949,7 @@ export default function App() {
           referenceAesthetics
         );
         setSynthesized(response);
+        setSynthesisProvenance({ origin: "fallback", reason: "network-error" });
         addOptimizationStep("Syntéza", response.finalPrompt);
         if (isReviewMode) {
           handleRunCritic(response.finalPrompt);
@@ -814,6 +977,7 @@ export default function App() {
       setTimeout(() => {
         const response = localRefinePrompt(synthesized.finalPrompt, currentEdits);
         setSynthesized(response);
+        setSynthesisProvenance({ origin: "offline-mode" });
         setRefining(false);
         addOptimizationStep(label, response.finalPrompt);
         setManualEdits("");
@@ -836,6 +1000,7 @@ export default function App() {
         const data = await response.json();
         if (data.error) throw new Error(data.error);
         setSynthesized(data);
+        setSynthesisProvenance(provenanceFrom(data));
         addOptimizationStep(label, data.finalPrompt);
         setManualEdits("");
         showToast("Reprocessed manual directives!");
@@ -846,6 +1011,7 @@ export default function App() {
         console.warn("Backend refinement failed, using offline compiler:", err);
         const response = localRefinePrompt(synthesized.finalPrompt, currentEdits);
         setSynthesized(response);
+        setSynthesisProvenance({ origin: "fallback", reason: "network-error" });
         addOptimizationStep(label, response.finalPrompt);
         setManualEdits("");
         if (isReviewMode) {
@@ -872,6 +1038,7 @@ export default function App() {
       setTimeout(() => {
         const review = localCriticPrompt(promptToReview);
         setCriticReview(review);
+        setCriticProvenance({ origin: "offline-mode" });
         setIsCriticizing(false);
         showToast("AI Critic dokončil analýzu slabých míst!");
       }, 700);
@@ -888,11 +1055,13 @@ export default function App() {
         const data = await response.json();
         if (data.error) throw new Error(data.error);
         setCriticReview(data);
+        setCriticProvenance(provenanceFrom(data));
         showToast("AI Critic analyzoval váš prompt!");
       } catch (err: any) {
         console.warn("Backend critic failed, using offline critic:", err);
         const review = localCriticPrompt(promptToReview);
         setCriticReview(review);
+        setCriticProvenance({ origin: "fallback", reason: "network-error" });
       } finally {
         setIsCriticizing(false);
       }
@@ -981,6 +1150,9 @@ export default function App() {
     });
     setCurrentPillar(3);
     setActiveSessionId(sess.id);
+    setSynthesisProvenance(null);
+    setCriticReview(null);
+    setCriticProvenance(null);
 
     if (sess.optimizationHistory && sess.optimizationHistory.length > 0) {
       setOptimizationHistory(sess.optimizationHistory);
@@ -1280,7 +1452,7 @@ export default function App() {
               
               <div className="relative group">
                 {/* Google AI Studio Inline Ghost Text Overlay */}
-                {activeGhostCompletion && (
+                {inlineGhostCompletion && (
                   <div 
                     className="absolute top-0 left-0 right-0 bottom-0 p-3.5 pr-20 text-sm font-medium font-sans leading-relaxed whitespace-pre-wrap break-words pointer-events-none select-none overflow-hidden z-0"
                     aria-hidden="true"
@@ -1289,7 +1461,7 @@ export default function App() {
                     <span className="opacity-0 text-transparent select-none">{ghostPrefixText}</span>
                     {/* Ghost completion text rendered in dimmed/faded cyan style */}
                     <span className="text-cyan-400/60 font-medium italic select-none bg-cyan-950/20 px-0.5 rounded border border-cyan-800/30 animate-pulse">
-                      {activeGhostCompletion}
+                      {inlineGhostCompletion}
                     </span>
                   </div>
                 )}
@@ -1297,6 +1469,7 @@ export default function App() {
                 <textarea
                   value={originalPrompt}
                   onChange={(e) => {
+                    rebaseDictation(e.target.value);
                     setOriginalPrompt(e.target.value);
                     setActivePredictionIndex(0);
                   }}
@@ -1355,6 +1528,28 @@ export default function App() {
                 </div>
               )}
 
+              {/* Question-mode candidate preview. Stands in for the inline ghost, which
+                  cannot align when the completion is inserted at the "?" rather than appended. */}
+              {activeGhostCompletion && !inlineGhostCompletion && activeCandidate && (
+                <div className="mt-2.5 bg-slate-950/80 border border-cyan-800/40 rounded-2xl p-3 text-[11px] leading-relaxed" id="question-prediction-preview">
+                  <div className="flex items-center gap-1.5 mb-1.5 text-[9px] font-mono font-bold uppercase tracking-wider text-slate-500">
+                    <HelpCircle className="w-3 h-3 text-cyan-400" />
+                    <span>Doplnění se vloží místo otazníku</span>
+                  </div>
+                  {'title' in activeCandidate && (
+                    <div className="text-cyan-300 font-semibold font-sans mb-1">
+                      {(activeCandidate as QuestionMarkPredictionCandidate).title}
+                    </div>
+                  )}
+                  <p className="text-slate-300 font-sans">
+                    <span className="text-slate-500">{ghostPrefixText}</span>
+                    <span className="text-cyan-400/90 italic bg-cyan-950/30 px-0.5 rounded">
+                      {activeGhostCompletion}
+                    </span>
+                  </p>
+                </div>
+              )}
+
               {/* Google AI Studio Autocomplete Control Bar */}
               {activeGhostCompletion ? (
                 <div className="mt-2.5 bg-slate-950/90 border border-cyan-500/40 rounded-2xl p-3 shadow-xl backdrop-blur-md animate-in fade-in slide-in-from-top-1 duration-200" id="aistudio-ghost-bar">
@@ -1372,16 +1567,18 @@ export default function App() {
                       </button>
 
                       {/* Incremental Word-by-Word Button */}
-                      <button
-                        type="button"
-                        onClick={handleApplyNextWordPrediction}
-                        id="accept-next-word-btn"
-                        className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-cyan-500/30 text-cyan-300 font-semibold font-sans text-xs hover:border-cyan-400 active:scale-95 transition-all shadow-xs cursor-pointer"
-                        title="Vložit pouze 1-2 další slova z nápovědy (Ctrl + →)"
-                      >
-                        <span className="bg-slate-950 px-1.5 py-0.5 rounded text-[9px] font-mono text-cyan-400 border border-slate-800">Ctrl + →</span>
-                        <span>+1 Slovo po slovu</span>
-                      </button>
+                      {canAcceptWordByWord && (
+                        <button
+                          type="button"
+                          onClick={handleApplyNextWordPrediction}
+                          id="accept-next-word-btn"
+                          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-cyan-500/30 text-cyan-300 font-semibold font-sans text-xs hover:border-cyan-400 active:scale-95 transition-all shadow-xs cursor-pointer"
+                          title="Vložit pouze 1-2 další slova z nápovědy (Ctrl + →)"
+                        >
+                          <span className="bg-slate-950 px-1.5 py-0.5 rounded text-[9px] font-mono text-cyan-400 border border-slate-800">Ctrl + →</span>
+                          <span>+1 Slovo po slovu</span>
+                        </button>
+                      )}
 
                       {/* Variant Cycle Controls */}
                       {currentPredictionList.length > 1 && (
@@ -1404,7 +1601,10 @@ export default function App() {
                     <div className="flex items-center gap-2.5 text-[10px] font-mono text-slate-400 w-full sm:w-auto justify-between sm:justify-end border-t sm:border-t-0 border-slate-900 pt-2 sm:pt-0">
                       <span className="flex items-center gap-1 text-slate-400">
                         <Sparkles className="w-3 h-3 text-cyan-400" />
-                        <span>Stiskněte <strong className="text-slate-200">[Tab]</strong> pro potvrdit nebo <strong className="text-slate-200">[Ctrl + →]</strong> po slovech</span>
+                        <span>
+                          Stiskněte <strong className="text-slate-200">[Tab]</strong> pro potvrdit
+                          {canAcceptWordByWord && <> nebo <strong className="text-slate-200">[Ctrl + →]</strong> po slovech</>}
+                        </span>
                       </span>
 
                       {predictionUndoStack.length > 0 && (
@@ -1789,6 +1989,8 @@ export default function App() {
                     </button>
                   </div>
 
+                  <ProvenanceBadge provenance={questionsProvenance} />
+
                   {/* High-Tech Glow Progress Bar */}
                   <div className="w-full bg-slate-950 h-2 rounded-full overflow-hidden border border-slate-800">
                     <div 
@@ -1855,16 +2057,22 @@ export default function App() {
                         Sourced catalogs (5 Best Templates)
                       </h3>
                       <p className="text-[11px] text-slate-500 font-medium">
-                        {offlineMode ? "Local backup catalog active" : "Web search grounded catalog active"}
+                        {catalogProvenance && catalogProvenance.origin !== "cloud"
+                          ? "Vestavěné šablony (bez webového vyhledávání)"
+                          : citations.length > 0
+                          ? "Web search grounded catalog active"
+                          : "Výstup modelu bez webových citací"}
                       </p>
                     </div>
 
-                    {!offlineMode && citations.length > 0 && (
+                    {citations.length > 0 && (
                       <span className="text-[9px] bg-emerald-950 text-emerald-400 font-bold px-2 py-0.5 rounded-full flex items-center gap-1 border border-emerald-800/30 font-mono">
                         <Globe className="w-2.5 h-2.5" /> GROUNDED
                       </span>
                     )}
                   </div>
+
+                  <ProvenanceBadge provenance={catalogProvenance} />
 
                   {/* Templates Feed */}
                   <div className="space-y-3 max-h-[385px] overflow-y-auto pr-1 no-scrollbar">
@@ -1924,7 +2132,7 @@ export default function App() {
                   </div>
 
                   {/* Sourced citations grounded references */}
-                  {!offlineMode && citations.length > 0 && (
+                  {citations.length > 0 && (
                     <div className="bg-slate-950 rounded-xl p-2.5 border border-slate-800 text-[10px] text-slate-400">
                       <span className="font-bold text-slate-300 block mb-1 font-mono">CYBERNETIC COPT-IN SOURCES:</span>
                       <div className="space-y-1">
@@ -2106,6 +2314,8 @@ export default function App() {
                             </div>
                           ) : criticReview ? (
                             <div className="space-y-3 pt-1">
+                              <ProvenanceBadge provenance={criticProvenance} />
+
                               {/* Summary Overview */}
                               <div className="p-2.5 rounded-xl bg-purple-950/40 border border-purple-900/50 text-[11px] text-purple-200 leading-relaxed font-sans">
                                 <span className="font-bold text-purple-300 font-mono block mb-0.5">Hodnocení AI Critic:</span>
@@ -2169,6 +2379,8 @@ export default function App() {
                         </div>
                       )}
                       
+                      <ProvenanceBadge provenance={synthesisProvenance} />
+
                       {/* Synthesized Output Terminal Screen */}
                       <div className="bg-slate-950 rounded-2xl border border-slate-800 p-3.5 relative shadow-xl">
                         <textarea
@@ -2302,6 +2514,14 @@ export default function App() {
                       setQuestions([]);
                       setCatalog([]);
                       setSynthesized(null);
+                      setCitations([]);
+                      setCriticReview(null);
+                      setManualEdits("");
+                      setOptimizationHistory([]);
+                      setQuestionsProvenance(null);
+                      setCatalogProvenance(null);
+                      setSynthesisProvenance(null);
+                      setCriticProvenance(null);
                       setCurrentPillar(1);
                       triggerICloudSync();
                     }}

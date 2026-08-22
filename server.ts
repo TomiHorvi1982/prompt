@@ -18,11 +18,94 @@ const PORT = 3000;
 
 app.use(express.json({ limit: "10mb" }));
 
+// Wraps an async handler so a rejected promise reaches Express' error middleware.
+// Without this an async throw becomes an unhandled rejection and Node exits.
+type AsyncHandler = (
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) => Promise<unknown>;
+
+function asyncRoute(handler: AsyncHandler) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
+
+// Normalizes untrusted request bodies. The offline engines are the failure path for
+// every endpoint, so they must never be handed a shape they can throw on.
+function asText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+function asAnswers(value: unknown): { question: string; answer: string }[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item: any) => ({
+    question: asText(item?.question),
+    answer: asText(item?.answer)
+  }));
+}
+
+function asCatalogItems(value: unknown): any[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item: any) => ({
+    title: asText(item?.title),
+    content: asText(item?.content),
+    suitability: asText(item?.suitability),
+    source: asText(item?.source)
+  }));
+}
+
+// Why a response was produced by the offline engine instead of the model. The client
+// shows this to the user, so a canned answer is never presented as a model answer.
+export type FallbackReason =
+  | "missing-api-key"
+  | "quota-exhausted"
+  | "api-error"
+  | "server-error";
+
+const MISSING_KEY_MESSAGE = "GEMINI_API_KEY is not configured in environment variables.";
+
+function classifyFailure(err: any): FallbackReason {
+  const message = String(err?.message ?? "");
+  if (message.includes(MISSING_KEY_MESSAGE)) return "missing-api-key";
+
+  const status = err?.status ?? err?.code ?? "";
+  const lower = message.toLowerCase();
+  const isQuota =
+    status === 429 ||
+    status === "RESOURCE_EXHAUSTED" ||
+    lower.includes("depleted") ||
+    lower.includes("prepayment") ||
+    lower.includes("billing") ||
+    lower.includes("quota");
+
+  return isQuota ? "quota-exhausted" : "api-error";
+}
+
+// A depleted quota is expected operation; a missing key or an unexpected API error is a
+// fault that should be visible to whoever runs this. Blanket-logging everything as
+// "quota reached" hid real failures behind a message that read like normal behaviour.
+function logFallback(endpoint: string, reason: FallbackReason, err: any) {
+  if (reason === "quota-exhausted") {
+    console.info(`${endpoint}: Gemini quota exhausted, serving offline engine result.`);
+    return;
+  }
+  if (reason === "missing-api-key") {
+    console.error(`${endpoint}: GEMINI_API_KEY is not set. Serving offline engine result.`);
+    return;
+  }
+  console.error(`${endpoint}: Gemini call failed (${reason}), serving offline engine result:`, err);
+}
+
 // Helper to initialize Gemini safely at request-time to prevent startup crashes if key is missing
 function getGeminiClient() {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error("GEMINI_API_KEY is not configured in environment variables.");
+    throw new Error(MISSING_KEY_MESSAGE);
   }
   return new GoogleGenAI({
     apiKey,
@@ -88,10 +171,10 @@ async function generateContentWithFallback(ai: GoogleGenAI, config: any, allowSe
 }
 
 // Endpoint 1: Generate 10-20 detailed context questions
-app.post("/api/generate-questions", async (req, res) => {
+app.post("/api/generate-questions", asyncRoute(async (req, res) => {
+  const prompt = asText(req.body?.prompt);
   try {
-    const { prompt } = req.body;
-    if (!prompt) {
+    if (!prompt.trim()) {
       return res.status(400).json({ error: "Original prompt is required" });
     }
 
@@ -131,22 +214,23 @@ Return a valid JSON array of objects, where each object has:
       const data = JSON.parse(response.text || "[]");
       return res.json({ questions: data });
     } catch (apiError: any) {
-      console.info("Gemini API quota reached/unavailable. Using high-performance offline engine for questions generation.");
+      const reason = classifyFailure(apiError);
+      logFallback("/api/generate-questions", reason, apiError);
       const fallbackQuestions = localGenerateQuestions(prompt);
-      return res.json({ questions: fallbackQuestions, isOfflineFallback: true });
+      return res.json({ questions: fallbackQuestions, isOfflineFallback: true, fallbackReason: reason });
     }
   } catch (error: any) {
-    console.info("Using offline engine for /api/generate-questions.");
-    const fallbackQuestions = localGenerateQuestions(req.body?.prompt || "");
-    return res.json({ questions: fallbackQuestions, isOfflineFallback: true });
+    logFallback("/api/generate-questions", "server-error", error);
+    const fallbackQuestions = localGenerateQuestions(prompt);
+    return res.json({ questions: fallbackQuestions, isOfflineFallback: true, fallbackReason: "server-error" });
   }
-});
+}));
 
 // Endpoint 2: Web ground prompt catalog search
-app.post("/api/search-catalog", async (req, res) => {
+app.post("/api/search-catalog", asyncRoute(async (req, res) => {
+  const prompt = asText(req.body?.prompt);
   try {
-    const { prompt } = req.body;
-    if (!prompt) {
+    if (!prompt.trim()) {
       return res.status(400).json({ error: "Original prompt is required" });
     }
 
@@ -195,22 +279,26 @@ Return as a valid JSON array.`;
 
       return res.json({ catalog, citations });
     } catch (apiError: any) {
-      console.info("Gemini API quota reached/unavailable. Using offline catalog engine.");
+      const reason = classifyFailure(apiError);
+      logFallback("/api/search-catalog", reason, apiError);
       const fallbackCatalog = localSearchCatalog(prompt);
-      return res.json({ catalog: fallbackCatalog, citations: [], isOfflineFallback: true });
+      return res.json({ catalog: fallbackCatalog, citations: [], isOfflineFallback: true, fallbackReason: reason });
     }
   } catch (error: any) {
-    console.info("Using offline catalog engine for /api/search-catalog.");
-    const fallbackCatalog = localSearchCatalog(req.body?.prompt || "");
-    return res.json({ catalog: fallbackCatalog, citations: [], isOfflineFallback: true });
+    logFallback("/api/search-catalog", "server-error", error);
+    const fallbackCatalog = localSearchCatalog(prompt);
+    return res.json({ catalog: fallbackCatalog, citations: [], isOfflineFallback: true, fallbackReason: "server-error" });
   }
-});
+}));
 
 // Endpoint 3: Synthesize universal prompt
-app.post("/api/synthesize-prompt", async (req, res) => {
+app.post("/api/synthesize-prompt", asyncRoute(async (req, res) => {
+  const originalPrompt = asText(req.body?.originalPrompt);
+  const answers = asAnswers(req.body?.answers);
+  const selectedCatalogPrompts = asCatalogItems(req.body?.selectedCatalogPrompts);
+  const referenceAesthetics = asText(req.body?.referenceAesthetics);
+
   try {
-    const { originalPrompt, answers, selectedCatalogPrompts, referenceAesthetics } = req.body;
-    
     try {
       const ai = getGeminiClient();
       const systemInstruction = `You are a Master Prompt Engineer.
@@ -250,32 +338,34 @@ Provide the response in JSON format with:
       const result = JSON.parse(response.text || "{}");
       return res.json(result);
     } catch (apiError: any) {
-      console.info("Gemini API quota reached/unavailable. Using offline synthesis engine.");
+      const reason = classifyFailure(apiError);
+      logFallback("/api/synthesize-prompt", reason, apiError);
       const fallbackResult = localSynthesizePrompt(
-        originalPrompt || "",
-        answers || [],
-        selectedCatalogPrompts || [],
+        originalPrompt,
+        answers,
+        selectedCatalogPrompts,
         referenceAesthetics
       );
-      return res.json({ ...fallbackResult, isOfflineFallback: true });
+      return res.json({ ...fallbackResult, isOfflineFallback: true, fallbackReason: reason });
     }
   } catch (error: any) {
-    console.info("Using offline engine for /api/synthesize-prompt.");
+    logFallback("/api/synthesize-prompt", "server-error", error);
     const fallbackResult = localSynthesizePrompt(
-      req.body?.originalPrompt || "",
-      req.body?.answers || [],
-      req.body?.selectedCatalogPrompts || [],
-      req.body?.referenceAesthetics
+      originalPrompt,
+      answers,
+      selectedCatalogPrompts,
+      referenceAesthetics
     );
-    return res.json({ ...fallbackResult, isOfflineFallback: true });
+    return res.json({ ...fallbackResult, isOfflineFallback: true, fallbackReason: "server-error" });
   }
-});
+}));
 
 // Endpoint 4: Refine/Recalculate prompt after manual adjustments
-app.post("/api/refine-prompt", async (req, res) => {
+app.post("/api/refine-prompt", asyncRoute(async (req, res) => {
+  const finalPrompt = asText(req.body?.finalPrompt);
+  const manualEdits = asText(req.body?.manualEdits);
+
   try {
-    const { finalPrompt, manualEdits } = req.body;
-    
     try {
       const ai = getGeminiClient();
       const systemInstruction = `You are a prompt optimizer.
@@ -309,22 +399,24 @@ Return the result in JSON format:
       const result = JSON.parse(response.text || "{}");
       return res.json(result);
     } catch (apiError: any) {
-      console.info("Gemini API quota reached/unavailable. Using offline refinement engine.");
-      const fallbackResult = localRefinePrompt(finalPrompt || "", manualEdits || "");
-      return res.json({ ...fallbackResult, isOfflineFallback: true });
+      const reason = classifyFailure(apiError);
+      logFallback("/api/refine-prompt", reason, apiError);
+      const fallbackResult = localRefinePrompt(finalPrompt, manualEdits);
+      return res.json({ ...fallbackResult, isOfflineFallback: true, fallbackReason: reason });
     }
   } catch (error: any) {
-    console.info("Using offline engine for /api/refine-prompt.");
-    const fallbackResult = localRefinePrompt(req.body?.finalPrompt || "", req.body?.manualEdits || "");
-    return res.json({ ...fallbackResult, isOfflineFallback: true });
+    logFallback("/api/refine-prompt", "server-error", error);
+    const fallbackResult = localRefinePrompt(finalPrompt, manualEdits);
+    return res.json({ ...fallbackResult, isOfflineFallback: true, fallbackReason: "server-error" });
   }
-});
+}));
 
 // Endpoint 5: AI Prompt Critic
-app.post("/api/critic-prompt", async (req, res) => {
+app.post("/api/critic-prompt", asyncRoute(async (req, res) => {
+  const finalPrompt = asText(req.body?.finalPrompt);
+  const originalIdea = asText(req.body?.originalIdea);
+
   try {
-    const { finalPrompt, originalIdea } = req.body;
-    
     try {
       const ai = getGeminiClient();
       const systemInstruction = `You are an expert AI Prompt Critic & Quality Assurance Auditor.
@@ -375,16 +467,17 @@ Return response strictly as JSON with:
       const result = JSON.parse(response.text || "{}");
       return res.json(result);
     } catch (apiError: any) {
-      console.info("Gemini API quota reached/unavailable. Using offline critic engine.");
-      const fallbackResult = localCriticPrompt(finalPrompt || "");
-      return res.json({ ...fallbackResult, isOfflineFallback: true });
+      const reason = classifyFailure(apiError);
+      logFallback("/api/critic-prompt", reason, apiError);
+      const fallbackResult = localCriticPrompt(finalPrompt);
+      return res.json({ ...fallbackResult, isOfflineFallback: true, fallbackReason: reason });
     }
   } catch (error: any) {
-    console.info("Using offline engine for /api/critic-prompt.");
-    const fallbackResult = localCriticPrompt(req.body?.finalPrompt || "");
-    return res.json({ ...fallbackResult, isOfflineFallback: true });
+    logFallback("/api/critic-prompt", "server-error", error);
+    const fallbackResult = localCriticPrompt(finalPrompt);
+    return res.json({ ...fallbackResult, isOfflineFallback: true, fallbackReason: "server-error" });
   }
-});
+}));
 
 // Serve frontend SPA or configure development middleware
 async function startServer() {
@@ -402,9 +495,38 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  // Catches anything the per-endpoint handling missed, so a bad request returns 500
+  // instead of escaping as an unhandled rejection.
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error("Unhandled error while serving request:", err);
+    if (res.headersSent) return;
+    res.status(500).json({ error: "Internal server error" });
+  });
+
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on port ${PORT}`);
+  });
+
+  // Bind failures arrive as an event, not a rejection, so without this the
+  // process-level handler below would swallow EADDRINUSE and leave a process alive
+  // that never serves anything. A server that cannot listen must exit.
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    console.error(`Server could not listen on port ${PORT}:`, err.message);
+    process.exit(1);
   });
 }
 
-startServer();
+// Node exits on an unhandled rejection by default; keep the process alive and log
+// instead, so one malformed request can never take the service down for everyone.
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection:", reason);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception:", err);
+});
+
+startServer().catch((err) => {
+  console.error("Failed to start server:", err);
+  process.exit(1);
+});

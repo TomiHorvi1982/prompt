@@ -22,8 +22,11 @@ export interface SynthesizedPromptResponse {
 
 // 1. Local Question Generator
 export function localGenerateQuestions(prompt: string): Question[] {
-  const normalized = prompt.toLowerCase();
-  
+  // Coerced for the same reason as localSynthesizePrompt: a throw here escapes the
+  // endpoint's catch block and takes the process down.
+  const safePrompt = String(prompt ?? "");
+  const normalized = safePrompt.toLowerCase();
+
   let categoryTheme = "General Prompting";
   if (normalized.includes("write") || normalized.includes("text") || normalized.includes("copy")) {
     categoryTheme = "Content Creation";
@@ -39,7 +42,7 @@ export function localGenerateQuestions(prompt: string): Question[] {
     {
       id: 1,
       category: "Core Persona",
-      question: `What specific role or expert persona should the AI adopt for: "${prompt}"?`,
+      question: `What specific role or expert persona should the AI adopt for: "${safePrompt}"?`,
       placeholder: "e.g., Senior iOS Engineer, Creative Copywriter, Harvard Business Advisor"
     },
     {
@@ -114,6 +117,9 @@ export function localGenerateQuestions(prompt: string): Question[] {
 }
 
 // 2. Local Prompt Catalog Sourcing
+// These are hand-written templates shipped with the app, not search results. Earlier they
+// carried source names of real sites ("PromptHero", "Awesome Prompts GitHub"), which
+// credited those sites for content they never published.
 export function localSearchCatalog(prompt: string): CatalogItem[] {
   const p = prompt;
   return [
@@ -125,7 +131,7 @@ export function localSearchCatalog(prompt: string): CatalogItem[] {
 - Always execute with meticulous attention to detail, optimal efficiency, and precise terminology.
 - Before formulating any final output, think step-by-step to outline constraints and edge cases.`,
       suitability: "Highly suitable if you need extreme precision, professional tone, and minimal fluff. Focuses heavily on the role declaration.",
-      source: "PromptHero (Local)"
+      source: "Vestavěná šablona"
     },
     {
       title: "Variable Inputs & Zero-Fluff Formatter",
@@ -139,7 +145,7 @@ Output the results in a beautiful Markdown table with the columns:
 
 Do not write any introductory sentences or concluding friendly remarks. Go straight to the table.`,
       suitability: "Best choice for data pipelines, automated reports, and structured tools that interface with other scripts.",
-      source: "Awesome Prompts GitHub (Local)"
+      source: "Vestavěná šablona"
     },
     {
       title: "Interactive CoT (Chain-of-Thought) Reasoner",
@@ -149,7 +155,7 @@ For any query regarding "${p}", follow these steps:
 2. Formulate 3 distinct conceptual approaches to the query.
 3. Choose the absolute best approach and present the final answer with a clear 'Why it works' annotation.`,
       suitability: "Excellent for complex reasoning, brainstorming, coding architecture, and strategy formulation.",
-      source: "Systeam Guide Catalog (Local)"
+      source: "Vestavěná šablona"
     },
     {
       title: "The Apple-Style Minimalist Editor",
@@ -159,7 +165,7 @@ When working on "${p}":
 - Avoid hyperbole, sales speak, and promotional emojis.
 - Use bullet points with bold keywords to highlight maximum value in minimum space.`,
       suitability: "Designed for premium consumer-facing content, UI copy, and sleek documentation in line with Cupertino style guidelines.",
-      source: "Apple Developer Forums (Local)"
+      source: "Vestavěná šablona"
     },
     {
       title: "The Robust Error-Handling Guardian",
@@ -168,7 +174,7 @@ When working on "${p}":
 - Provide defensive mitigations for each vector.
 - Output code or instructions in a way that minimizes runtime or interpretive errors.`,
       suitability: "Highly recommended for coding, safety manuals, or technical procedures where failure is expensive.",
-      source: "PromptCraft Catalog (Local)"
+      source: "Vestavěná šablona"
     }
   ];
 }
@@ -180,9 +186,20 @@ export function localSynthesizePrompt(
   selectedCatalogPrompts: CatalogItem[],
   referenceAesthetics: string
 ): SynthesizedPromptResponse {
-  
-  let qSection = answers
-    .filter(a => a.answer.trim() !== "")
+
+  // This engine is the last line of defence when the Gemini call fails, so it must
+  // never throw on malformed input — a throw here escapes the endpoint's catch block.
+  const safeAnswers = (Array.isArray(answers) ? answers : [])
+    .map(a => ({
+      question: String(a?.question ?? "").trim(),
+      answer: String(a?.answer ?? "").trim()
+    }))
+    .filter(a => a.answer !== "");
+
+  const safeCatalog = (Array.isArray(selectedCatalogPrompts) ? selectedCatalogPrompts : [])
+    .map(c => String(c?.title ?? "Untitled template").trim());
+
+  let qSection = safeAnswers
     .map(a => `- **${a.question}**: ${a.answer}`)
     .join("\n");
 
@@ -190,7 +207,7 @@ export function localSynthesizePrompt(
     qSection = "- *No additional context provided*";
   }
 
-  const selectedTitles = selectedCatalogPrompts.map(c => `"${c.title}"`).join(", ") || "None selected";
+  const selectedTitles = safeCatalog.map(t => `"${t}"`).join(", ") || "None selected";
 
   const synthesized = `# ROLE & CONTEXT
 Adopt the persona of an expert in prompt engineering and optimization.
@@ -219,7 +236,7 @@ Your output should incorporate the following visual or UI aesthetic style:
 
   return {
     finalPrompt: synthesized,
-    explanation: `Successfully synthesized offline. Integrated your core prompt, ${answers.filter(a => a.answer.trim() !== "").length} context answers, and structural elements from ${selectedCatalogPrompts.length} catalog template(s): ${selectedTitles}.`
+    explanation: `Successfully synthesized offline. Integrated your core prompt, ${safeAnswers.length} context answers, and structural elements from ${safeCatalog.length} catalog template(s): ${selectedTitles}.`
   };
 }
 
