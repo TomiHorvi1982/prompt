@@ -516,39 +516,76 @@ export default function App() {
     }, 1250);
   };
 
+  // Guards the persistence effect below: it must not run before the initial load has
+  // finished, or the first render's empty array would overwrite what is in storage.
+  // This is state rather than a ref on purpose — both effects run in the same commit,
+  // so a ref set by the loader would already read true in the writer, with the writer
+  // still closed over the empty array from that render.
+  const [sessionsHydrated, setSessionsHydrated] = useState(false);
+
+  // Coerces one stored entry into a usable session. Storage is user-writable and may
+  // hold entries from an older schema, so nothing here may assume a field exists.
+  const normalizeSession = (raw: any, index: number): SavedPromptSession => ({
+    id: String(raw?.id ?? `restored-${index}-${Date.now()}`),
+    title: String(raw?.title ?? "Untitled prompt"),
+    originalPrompt: String(raw?.originalPrompt ?? ""),
+    finalPrompt: String(raw?.finalPrompt ?? ""),
+    timestamp: String(raw?.timestamp ?? "Unknown"),
+    optimizationHistory: Array.isArray(raw?.optimizationHistory) ? raw.optimizationHistory : undefined
+  });
+
   // Load Saved Sessions from LocalStorage
   useEffect(() => {
-    const stored = localStorage.getItem("prompt_architect_sessions");
-    if (stored) {
-      setSavedSessions(JSON.parse(stored));
-    } else {
-      const sampleSessions: SavedPromptSession[] = [
-        {
-          id: "1",
-          title: "Neural Fitness Planner",
-          originalPrompt: "Create a personalized fitness planner for busy professionals.",
-          finalPrompt: "# ROLE & CONTEXT\nAdopt the persona of an elite AI Health Specialist...",
-          timestamp: "Yesterday, 4:20 PM"
-        },
-        {
-          id: "2",
-          title: "SaaS Conversational Engine",
-          originalPrompt: "Write compelling landing page copy.",
-          finalPrompt: "# ROLE: Expert AI Conversion Copywriter...",
-          timestamp: "2 days ago"
+    const sampleSessions: SavedPromptSession[] = [
+      {
+        id: "1",
+        title: "Neural Fitness Planner",
+        originalPrompt: "Create a personalized fitness planner for busy professionals.",
+        finalPrompt: "# ROLE & CONTEXT\nAdopt the persona of an elite AI Health Specialist...",
+        timestamp: "Yesterday, 4:20 PM"
+      },
+      {
+        id: "2",
+        title: "SaaS Conversational Engine",
+        originalPrompt: "Write compelling landing page copy.",
+        finalPrompt: "# ROLE: Expert AI Conversion Copywriter...",
+        timestamp: "2 days ago"
+      }
+    ];
+
+    // Storage can be unreadable (Safari private mode, disabled cookies) or hold data
+    // this build cannot parse. Neither may take the app down on mount.
+    try {
+      const stored = localStorage.getItem("prompt_architect_sessions");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed)) {
+          setSavedSessions(parsed.map(normalizeSession));
+        } else {
+          throw new Error("Stored sessions are not an array");
         }
-      ];
-      localStorage.setItem("prompt_architect_sessions", JSON.stringify(sampleSessions));
+      } else {
+        localStorage.setItem("prompt_architect_sessions", JSON.stringify(sampleSessions));
+        setSavedSessions(sampleSessions);
+      }
+    } catch (err) {
+      console.warn("Could not restore saved sessions, starting from defaults:", err);
       setSavedSessions(sampleSessions);
+    } finally {
+      setSessionsHydrated(true);
     }
   }, []);
 
-  // Trigger auto iCloud sync on sessions update
+  // Persist sessions on every change. Writing an empty array is intentional — it is
+  // how deleting the last session is recorded.
   useEffect(() => {
-    if (savedSessions.length > 0) {
+    if (!sessionsHydrated) return;
+    try {
       localStorage.setItem("prompt_architect_sessions", JSON.stringify(savedSessions));
+    } catch (err) {
+      console.warn("Could not persist saved sessions:", err);
     }
-  }, [savedSessions]);
+  }, [savedSessions, sessionsHydrated]);
 
   // Toast utility helper
   const [lastToast, setLastToast] = useState("");
