@@ -53,7 +53,7 @@ import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianG
 import { OptimizationHistoryChart } from "./components/OptimizationHistoryChart";
 import DeepAnalysisView from "./components/DeepAnalysisView";
 
-import { Question, CatalogPrompt, Citation, SynthesizedPrompt, SavedPromptSession, LocalEngine, OptimizationStep, CriticReview, QuestionMarkPredictionCandidate } from "./types";
+import { Question, CatalogPrompt, Citation, SynthesizedPrompt, SavedPromptSession, LocalEngine, OptimizationStep, CriticReview, QuestionMarkPredictionCandidate, OutputProvenance, FallbackReason } from "./types";
 import { AESTHETIC_PRESETS, STARTER_TEMPLATES } from "./data";
 import { 
   localGenerateQuestions, 
@@ -66,6 +66,46 @@ import {
   calculateComplexity,
   getQuestionMarkPredictions
 } from "./lib/localModel";
+
+// Tells the user where a block of content came from. Local results were previously
+// indistinguishable from model output, so a canned answer could be read as a real one.
+function ProvenanceBadge({ provenance }: { provenance: OutputProvenance | null }) {
+  if (!provenance || provenance.origin === "cloud") return null;
+
+  const reasonText: Record<FallbackReason, string> = {
+    "missing-api-key": "není nastavený API klíč",
+    "quota-exhausted": "vyčerpaná kvóta API",
+    "api-error": "chyba API",
+    "server-error": "chyba serveru",
+    "network-error": "server nedostupný"
+  };
+
+  const isChosen = provenance.origin === "offline-mode";
+  const detail = provenance.reason ? reasonText[provenance.reason] : "";
+
+  return (
+    <div
+      className={`flex items-start gap-1.5 px-2.5 py-1.5 rounded-xl border text-[10px] font-mono leading-relaxed ${
+        isChosen
+          ? "bg-slate-900/60 border-slate-700/60 text-slate-300"
+          : "bg-amber-950/40 border-amber-700/50 text-amber-300"
+      }`}
+    >
+      {isChosen
+        ? <Cpu className="w-3.5 h-3.5 shrink-0 mt-px text-slate-400" />
+        : <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px text-amber-400" />}
+      <span>
+        <strong className="font-bold">
+          {isChosen ? "Lokální engine" : "Nouzová lokální šablona"}
+        </strong>
+        {" — "}
+        {isChosen
+          ? "výstup vytvořilo zařízení, ne jazykový model."
+          : `model neodpověděl (${detail}), zobrazen předpřipravený text. Nejde o výstup AI.`}
+      </span>
+    </div>
+  );
+}
 
 export default function App() {
   // Device Frame & Viewport State (Mobile, Tablet, PC)
@@ -84,6 +124,18 @@ export default function App() {
   const liveWordCount = useMemo(() => originalPrompt.trim().split(/\s+/).filter(Boolean).length, [originalPrompt]);
   const liveCharCount = originalPrompt.length;
   const [currentPillar, setCurrentPillar] = useState<1 | 2 | 3>(1);
+
+  // Where each block of generated content actually came from (model vs. local engine).
+  const [questionsProvenance, setQuestionsProvenance] = useState<OutputProvenance | null>(null);
+  const [catalogProvenance, setCatalogProvenance] = useState<OutputProvenance | null>(null);
+  const [synthesisProvenance, setSynthesisProvenance] = useState<OutputProvenance | null>(null);
+  const [criticProvenance, setCriticProvenance] = useState<OutputProvenance | null>(null);
+
+  // Reads the server's honest self-report off a response body.
+  const provenanceFrom = (data: any): OutputProvenance =>
+    data?.isOfflineFallback
+      ? { origin: "fallback", reason: data?.fallbackReason ?? "api-error" }
+      : { origin: "cloud" };
 
   // Pillar 1: Context Questions
   const [questions, setQuestions] = useState<Question[]>([]);
@@ -706,6 +758,14 @@ export default function App() {
     setSynthesized(null);
     setCurrentPillar(1);
 
+    // A new run must not inherit the previous run's citations, critique or provenance.
+    setCitations([]);
+    setCriticReview(null);
+    setQuestionsProvenance(null);
+    setCatalogProvenance(null);
+    setSynthesisProvenance(null);
+    setCriticProvenance(null);
+
     // Initialize Optimization History
     const initialStep: OptimizationStep = {
       stepIndex: 0,
@@ -727,10 +787,13 @@ export default function App() {
       setTimeout(() => {
         const localQs = localGenerateQuestions(promptToUse);
         setQuestions(localQs);
+        setQuestionsProvenance({ origin: "offline-mode" });
         setLoadingQuestions(false);
 
         const localCat = localSearchCatalog(promptToUse);
         setCatalog(localCat);
+        setCatalogProvenance({ origin: "offline-mode" });
+        setCitations([]);
         setLoadingCatalog(false);
         showToast("Initialized offline models");
       }, 750);
@@ -744,10 +807,12 @@ export default function App() {
         const qData = await qRes.json();
         if (qData.error) throw new Error(qData.error);
         setQuestions(qData.questions || []);
+        setQuestionsProvenance(provenanceFrom(qData));
       } catch (err: any) {
         console.warn("Backend error, falling back to local simulation:", err);
         const localQs = localGenerateQuestions(promptToUse);
         setQuestions(localQs);
+        setQuestionsProvenance({ origin: "fallback", reason: "network-error" });
       } finally {
         setLoadingQuestions(false);
       }
@@ -762,10 +827,13 @@ export default function App() {
         if (cData.error) throw new Error(cData.error);
         setCatalog(cData.catalog || []);
         setCitations(cData.citations || []);
+        setCatalogProvenance(provenanceFrom(cData));
       } catch (err: any) {
         console.warn("Backend catalog search error, using local simulation:", err);
         const localCat = localSearchCatalog(promptToUse);
         setCatalog(localCat);
+        setCitations([]);
+        setCatalogProvenance({ origin: "fallback", reason: "network-error" });
       } finally {
         setLoadingCatalog(false);
       }
@@ -843,6 +911,7 @@ export default function App() {
           ...response,
           explanation: enrichedExplanation
         });
+        setSynthesisProvenance({ origin: "offline-mode" });
         setSynthesizing(false);
         addOptimizationStep("Syntéza", response.finalPrompt);
         showToast(`Zpracováno lokálně modelem: ${engineName}!`);
@@ -866,6 +935,7 @@ export default function App() {
         const data = await response.json();
         if (data.error) throw new Error(data.error);
         setSynthesized(data);
+        setSynthesisProvenance(provenanceFrom(data));
         addOptimizationStep("Syntéza", data.finalPrompt);
         if (isReviewMode) {
           handleRunCritic(data.finalPrompt);
@@ -879,6 +949,7 @@ export default function App() {
           referenceAesthetics
         );
         setSynthesized(response);
+        setSynthesisProvenance({ origin: "fallback", reason: "network-error" });
         addOptimizationStep("Syntéza", response.finalPrompt);
         if (isReviewMode) {
           handleRunCritic(response.finalPrompt);
@@ -906,6 +977,7 @@ export default function App() {
       setTimeout(() => {
         const response = localRefinePrompt(synthesized.finalPrompt, currentEdits);
         setSynthesized(response);
+        setSynthesisProvenance({ origin: "offline-mode" });
         setRefining(false);
         addOptimizationStep(label, response.finalPrompt);
         setManualEdits("");
@@ -928,6 +1000,7 @@ export default function App() {
         const data = await response.json();
         if (data.error) throw new Error(data.error);
         setSynthesized(data);
+        setSynthesisProvenance(provenanceFrom(data));
         addOptimizationStep(label, data.finalPrompt);
         setManualEdits("");
         showToast("Reprocessed manual directives!");
@@ -938,6 +1011,7 @@ export default function App() {
         console.warn("Backend refinement failed, using offline compiler:", err);
         const response = localRefinePrompt(synthesized.finalPrompt, currentEdits);
         setSynthesized(response);
+        setSynthesisProvenance({ origin: "fallback", reason: "network-error" });
         addOptimizationStep(label, response.finalPrompt);
         setManualEdits("");
         if (isReviewMode) {
@@ -964,6 +1038,7 @@ export default function App() {
       setTimeout(() => {
         const review = localCriticPrompt(promptToReview);
         setCriticReview(review);
+        setCriticProvenance({ origin: "offline-mode" });
         setIsCriticizing(false);
         showToast("AI Critic dokončil analýzu slabých míst!");
       }, 700);
@@ -980,11 +1055,13 @@ export default function App() {
         const data = await response.json();
         if (data.error) throw new Error(data.error);
         setCriticReview(data);
+        setCriticProvenance(provenanceFrom(data));
         showToast("AI Critic analyzoval váš prompt!");
       } catch (err: any) {
         console.warn("Backend critic failed, using offline critic:", err);
         const review = localCriticPrompt(promptToReview);
         setCriticReview(review);
+        setCriticProvenance({ origin: "fallback", reason: "network-error" });
       } finally {
         setIsCriticizing(false);
       }
@@ -1073,6 +1150,9 @@ export default function App() {
     });
     setCurrentPillar(3);
     setActiveSessionId(sess.id);
+    setSynthesisProvenance(null);
+    setCriticReview(null);
+    setCriticProvenance(null);
 
     if (sess.optimizationHistory && sess.optimizationHistory.length > 0) {
       setOptimizationHistory(sess.optimizationHistory);
@@ -1909,6 +1989,8 @@ export default function App() {
                     </button>
                   </div>
 
+                  <ProvenanceBadge provenance={questionsProvenance} />
+
                   {/* High-Tech Glow Progress Bar */}
                   <div className="w-full bg-slate-950 h-2 rounded-full overflow-hidden border border-slate-800">
                     <div 
@@ -1975,16 +2057,22 @@ export default function App() {
                         Sourced catalogs (5 Best Templates)
                       </h3>
                       <p className="text-[11px] text-slate-500 font-medium">
-                        {offlineMode ? "Local backup catalog active" : "Web search grounded catalog active"}
+                        {catalogProvenance && catalogProvenance.origin !== "cloud"
+                          ? "Vestavěné šablony (bez webového vyhledávání)"
+                          : citations.length > 0
+                          ? "Web search grounded catalog active"
+                          : "Výstup modelu bez webových citací"}
                       </p>
                     </div>
 
-                    {!offlineMode && citations.length > 0 && (
+                    {citations.length > 0 && (
                       <span className="text-[9px] bg-emerald-950 text-emerald-400 font-bold px-2 py-0.5 rounded-full flex items-center gap-1 border border-emerald-800/30 font-mono">
                         <Globe className="w-2.5 h-2.5" /> GROUNDED
                       </span>
                     )}
                   </div>
+
+                  <ProvenanceBadge provenance={catalogProvenance} />
 
                   {/* Templates Feed */}
                   <div className="space-y-3 max-h-[385px] overflow-y-auto pr-1 no-scrollbar">
@@ -2044,7 +2132,7 @@ export default function App() {
                   </div>
 
                   {/* Sourced citations grounded references */}
-                  {!offlineMode && citations.length > 0 && (
+                  {citations.length > 0 && (
                     <div className="bg-slate-950 rounded-xl p-2.5 border border-slate-800 text-[10px] text-slate-400">
                       <span className="font-bold text-slate-300 block mb-1 font-mono">CYBERNETIC COPT-IN SOURCES:</span>
                       <div className="space-y-1">
@@ -2226,6 +2314,8 @@ export default function App() {
                             </div>
                           ) : criticReview ? (
                             <div className="space-y-3 pt-1">
+                              <ProvenanceBadge provenance={criticProvenance} />
+
                               {/* Summary Overview */}
                               <div className="p-2.5 rounded-xl bg-purple-950/40 border border-purple-900/50 text-[11px] text-purple-200 leading-relaxed font-sans">
                                 <span className="font-bold text-purple-300 font-mono block mb-0.5">Hodnocení AI Critic:</span>
@@ -2289,6 +2379,8 @@ export default function App() {
                         </div>
                       )}
                       
+                      <ProvenanceBadge provenance={synthesisProvenance} />
+
                       {/* Synthesized Output Terminal Screen */}
                       <div className="bg-slate-950 rounded-2xl border border-slate-800 p-3.5 relative shadow-xl">
                         <textarea
@@ -2422,6 +2514,14 @@ export default function App() {
                       setQuestions([]);
                       setCatalog([]);
                       setSynthesized(null);
+                      setCitations([]);
+                      setCriticReview(null);
+                      setManualEdits("");
+                      setOptimizationHistory([]);
+                      setQuestionsProvenance(null);
+                      setCatalogProvenance(null);
+                      setSynthesisProvenance(null);
+                      setCriticProvenance(null);
                       setCurrentPillar(1);
                       triggerICloudSync();
                     }}

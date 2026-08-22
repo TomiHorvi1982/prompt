@@ -85,3 +85,19 @@ export interface QuestionMarkPredictionCandidate {
   fullTextPreview: string;
 }
 
+
+// Where a piece of generated content actually came from, so the UI never presents a
+// canned local result as a model answer.
+export type OutputOrigin = "cloud" | "offline-mode" | "fallback";
+
+export type FallbackReason =
+  | "missing-api-key"
+  | "quota-exhausted"
+  | "api-error"
+  | "server-error"
+  | "network-error";
+
+export interface OutputProvenance {
+  origin: OutputOrigin;
+  reason?: FallbackReason;
+}

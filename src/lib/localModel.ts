@@ -117,6 +117,9 @@ export function localGenerateQuestions(prompt: string): Question[] {
 }
 
 // 2. Local Prompt Catalog Sourcing
+// These are hand-written templates shipped with the app, not search results. Earlier they
+// carried source names of real sites ("PromptHero", "Awesome Prompts GitHub"), which
+// credited those sites for content they never published.
 export function localSearchCatalog(prompt: string): CatalogItem[] {
   const p = prompt;
   return [
@@ -128,7 +131,7 @@ export function localSearchCatalog(prompt: string): CatalogItem[] {
 - Always execute with meticulous attention to detail, optimal efficiency, and precise terminology.
 - Before formulating any final output, think step-by-step to outline constraints and edge cases.`,
       suitability: "Highly suitable if you need extreme precision, professional tone, and minimal fluff. Focuses heavily on the role declaration.",
-      source: "PromptHero (Local)"
+      source: "Vestavěná šablona"
     },
     {
       title: "Variable Inputs & Zero-Fluff Formatter",
@@ -142,7 +145,7 @@ Output the results in a beautiful Markdown table with the columns:
 
 Do not write any introductory sentences or concluding friendly remarks. Go straight to the table.`,
       suitability: "Best choice for data pipelines, automated reports, and structured tools that interface with other scripts.",
-      source: "Awesome Prompts GitHub (Local)"
+      source: "Vestavěná šablona"
     },
     {
       title: "Interactive CoT (Chain-of-Thought) Reasoner",
@@ -152,7 +155,7 @@ For any query regarding "${p}", follow these steps:
 2. Formulate 3 distinct conceptual approaches to the query.
 3. Choose the absolute best approach and present the final answer with a clear 'Why it works' annotation.`,
       suitability: "Excellent for complex reasoning, brainstorming, coding architecture, and strategy formulation.",
-      source: "Systeam Guide Catalog (Local)"
+      source: "Vestavěná šablona"
     },
     {
       title: "The Apple-Style Minimalist Editor",
@@ -162,7 +165,7 @@ When working on "${p}":
 - Avoid hyperbole, sales speak, and promotional emojis.
 - Use bullet points with bold keywords to highlight maximum value in minimum space.`,
       suitability: "Designed for premium consumer-facing content, UI copy, and sleek documentation in line with Cupertino style guidelines.",
-      source: "Apple Developer Forums (Local)"
+      source: "Vestavěná šablona"
     },
     {
       title: "The Robust Error-Handling Guardian",
@@ -171,7 +174,7 @@ When working on "${p}":
 - Provide defensive mitigations for each vector.
 - Output code or instructions in a way that minimizes runtime or interpretive errors.`,
       suitability: "Highly recommended for coding, safety manuals, or technical procedures where failure is expensive.",
-      source: "PromptCraft Catalog (Local)"
+      source: "Vestavěná šablona"
     }
   ];
 }

@@ -59,11 +59,53 @@ function asCatalogItems(value: unknown): any[] {
   }));
 }
 
+// Why a response was produced by the offline engine instead of the model. The client
+// shows this to the user, so a canned answer is never presented as a model answer.
+export type FallbackReason =
+  | "missing-api-key"
+  | "quota-exhausted"
+  | "api-error"
+  | "server-error";
+
+const MISSING_KEY_MESSAGE = "GEMINI_API_KEY is not configured in environment variables.";
+
+function classifyFailure(err: any): FallbackReason {
+  const message = String(err?.message ?? "");
+  if (message.includes(MISSING_KEY_MESSAGE)) return "missing-api-key";
+
+  const status = err?.status ?? err?.code ?? "";
+  const lower = message.toLowerCase();
+  const isQuota =
+    status === 429 ||
+    status === "RESOURCE_EXHAUSTED" ||
+    lower.includes("depleted") ||
+    lower.includes("prepayment") ||
+    lower.includes("billing") ||
+    lower.includes("quota");
+
+  return isQuota ? "quota-exhausted" : "api-error";
+}
+
+// A depleted quota is expected operation; a missing key or an unexpected API error is a
+// fault that should be visible to whoever runs this. Blanket-logging everything as
+// "quota reached" hid real failures behind a message that read like normal behaviour.
+function logFallback(endpoint: string, reason: FallbackReason, err: any) {
+  if (reason === "quota-exhausted") {
+    console.info(`${endpoint}: Gemini quota exhausted, serving offline engine result.`);
+    return;
+  }
+  if (reason === "missing-api-key") {
+    console.error(`${endpoint}: GEMINI_API_KEY is not set. Serving offline engine result.`);
+    return;
+  }
+  console.error(`${endpoint}: Gemini call failed (${reason}), serving offline engine result:`, err);
+}
+
 // Helper to initialize Gemini safely at request-time to prevent startup crashes if key is missing
 function getGeminiClient() {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error("GEMINI_API_KEY is not configured in environment variables.");
+    throw new Error(MISSING_KEY_MESSAGE);
   }
   return new GoogleGenAI({
     apiKey,
@@ -172,14 +214,15 @@ Return a valid JSON array of objects, where each object has:
       const data = JSON.parse(response.text || "[]");
       return res.json({ questions: data });
     } catch (apiError: any) {
-      console.info("Gemini API quota reached/unavailable. Using high-performance offline engine for questions generation.");
+      const reason = classifyFailure(apiError);
+      logFallback("/api/generate-questions", reason, apiError);
       const fallbackQuestions = localGenerateQuestions(prompt);
-      return res.json({ questions: fallbackQuestions, isOfflineFallback: true });
+      return res.json({ questions: fallbackQuestions, isOfflineFallback: true, fallbackReason: reason });
     }
   } catch (error: any) {
-    console.info("Using offline engine for /api/generate-questions.");
+    logFallback("/api/generate-questions", "server-error", error);
     const fallbackQuestions = localGenerateQuestions(prompt);
-    return res.json({ questions: fallbackQuestions, isOfflineFallback: true });
+    return res.json({ questions: fallbackQuestions, isOfflineFallback: true, fallbackReason: "server-error" });
   }
 }));
 
@@ -236,14 +279,15 @@ Return as a valid JSON array.`;
 
       return res.json({ catalog, citations });
     } catch (apiError: any) {
-      console.info("Gemini API quota reached/unavailable. Using offline catalog engine.");
+      const reason = classifyFailure(apiError);
+      logFallback("/api/search-catalog", reason, apiError);
       const fallbackCatalog = localSearchCatalog(prompt);
-      return res.json({ catalog: fallbackCatalog, citations: [], isOfflineFallback: true });
+      return res.json({ catalog: fallbackCatalog, citations: [], isOfflineFallback: true, fallbackReason: reason });
     }
   } catch (error: any) {
-    console.info("Using offline catalog engine for /api/search-catalog.");
+    logFallback("/api/search-catalog", "server-error", error);
     const fallbackCatalog = localSearchCatalog(prompt);
-    return res.json({ catalog: fallbackCatalog, citations: [], isOfflineFallback: true });
+    return res.json({ catalog: fallbackCatalog, citations: [], isOfflineFallback: true, fallbackReason: "server-error" });
   }
 }));
 
@@ -294,24 +338,25 @@ Provide the response in JSON format with:
       const result = JSON.parse(response.text || "{}");
       return res.json(result);
     } catch (apiError: any) {
-      console.info("Gemini API quota reached/unavailable. Using offline synthesis engine.");
+      const reason = classifyFailure(apiError);
+      logFallback("/api/synthesize-prompt", reason, apiError);
       const fallbackResult = localSynthesizePrompt(
         originalPrompt,
         answers,
         selectedCatalogPrompts,
         referenceAesthetics
       );
-      return res.json({ ...fallbackResult, isOfflineFallback: true });
+      return res.json({ ...fallbackResult, isOfflineFallback: true, fallbackReason: reason });
     }
   } catch (error: any) {
-    console.info("Using offline engine for /api/synthesize-prompt.");
+    logFallback("/api/synthesize-prompt", "server-error", error);
     const fallbackResult = localSynthesizePrompt(
       originalPrompt,
       answers,
       selectedCatalogPrompts,
       referenceAesthetics
     );
-    return res.json({ ...fallbackResult, isOfflineFallback: true });
+    return res.json({ ...fallbackResult, isOfflineFallback: true, fallbackReason: "server-error" });
   }
 }));
 
@@ -354,14 +399,15 @@ Return the result in JSON format:
       const result = JSON.parse(response.text || "{}");
       return res.json(result);
     } catch (apiError: any) {
-      console.info("Gemini API quota reached/unavailable. Using offline refinement engine.");
+      const reason = classifyFailure(apiError);
+      logFallback("/api/refine-prompt", reason, apiError);
       const fallbackResult = localRefinePrompt(finalPrompt, manualEdits);
-      return res.json({ ...fallbackResult, isOfflineFallback: true });
+      return res.json({ ...fallbackResult, isOfflineFallback: true, fallbackReason: reason });
     }
   } catch (error: any) {
-    console.info("Using offline engine for /api/refine-prompt.");
+    logFallback("/api/refine-prompt", "server-error", error);
     const fallbackResult = localRefinePrompt(finalPrompt, manualEdits);
-    return res.json({ ...fallbackResult, isOfflineFallback: true });
+    return res.json({ ...fallbackResult, isOfflineFallback: true, fallbackReason: "server-error" });
   }
 }));
 
@@ -421,14 +467,15 @@ Return response strictly as JSON with:
       const result = JSON.parse(response.text || "{}");
       return res.json(result);
     } catch (apiError: any) {
-      console.info("Gemini API quota reached/unavailable. Using offline critic engine.");
+      const reason = classifyFailure(apiError);
+      logFallback("/api/critic-prompt", reason, apiError);
       const fallbackResult = localCriticPrompt(finalPrompt);
-      return res.json({ ...fallbackResult, isOfflineFallback: true });
+      return res.json({ ...fallbackResult, isOfflineFallback: true, fallbackReason: reason });
     }
   } catch (error: any) {
-    console.info("Using offline engine for /api/critic-prompt.");
+    logFallback("/api/critic-prompt", "server-error", error);
     const fallbackResult = localCriticPrompt(finalPrompt);
-    return res.json({ ...fallbackResult, isOfflineFallback: true });
+    return res.json({ ...fallbackResult, isOfflineFallback: true, fallbackReason: "server-error" });
   }
 }));
 
