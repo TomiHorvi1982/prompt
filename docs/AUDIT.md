@@ -20,8 +20,11 @@ nikdy nezobrazí. Uživatel tedy nemá jak poznat, že „AI výstup" je konzerv
 |---|---|
 | Kritická | 2 |
 | Vysoká | 6 |
-| Střední | 11 |
+| Střední | 10 (+1 stažený) |
 | Nízká / úklid | 9 |
+
+> **Revize po ověření s platným API klíčem.** H2 má potvrzený dopad, ale jinou příčinu, než
+> nález původně tvrdil. M3 byl chybný a je stažen. Detaily u jednotlivých nálezů.
 
 ---
 
@@ -112,27 +115,60 @@ Důsledky:
   s vymyšlenými zdroji (`"PromptHero (Local)"`, `"Awesome Prompts GitHub (Local)"`).
 * Provozní chyby jsou neviditelné — server nikdy nevrátí 5xx, monitoring nic nezachytí.
 
+**Potvrzeno end-to-end s platným API klíčem.** Nejde o teoretický scénář — s klíčem, na kterém
+běžná volání fungují, se to chová takto:
+
+```
+/api/generate-questions   isOfflineFallback: False   Q1: "Who is the ideal target audience
+                                                          or buyer persona for this SaaS product?"
+/api/search-catalog       isOfflineFallback: True    citations: 0
+                          zdroje: "PromptHero (Local)", "Awesome Prompts GitHub (Local)", ...
+```
+
+Jeden endpoint vrací skutečnou odpověď modelu, druhý konzervovaná data s vymyšlenými zdroji —
+a UI mezi nimi nedělá žádný rozdíl. Uživatel se o tom nemá jak dozvědět.
+
 **Oprava:** rozlišit typy chyb (chybí klíč → 503 + jasná hláška; kvóta → fallback), příznak
 `isOfflineFallback` promítnout do UI jako viditelný odznak u každého vygenerovaného výstupu.
 
-### H2 — Web-grounded katalog pravděpodobně nikdy nefunguje
+### H2 — Web-grounded katalog nikdy nevrací webová data (ověřeno, ale jiná příčina)
 
 **Soubor:** `server.ts:166-186`
+**Status:** dopad potvrzen živým voláním; **původní hypotéza se nepotvrdila**
 
 `/api/search-catalog` posílá zároveň `tools: [{ googleSearch: {} }]` **a**
-`responseMimeType: "application/json"` + `responseSchema`. Structured output a nástroj Google
-Search se v Gemini API vzájemně vylučují — požadavek by měl skončit chybou 400.
+`responseMimeType: "application/json"` + `responseSchema`. Původní znění tohoto nálezu tvrdilo,
+že se tyto dvě věci v Gemini API vzájemně vylučují a request končí chybou 400. **To se
+nepotvrdilo.**
 
-Kvůli H1 se chyba nikdy neprojeví: request spadne do fallbacku a uživatel dostane lokální
-katalog označený jako „grounded". Vlajková funkce aplikace tak podle všeho nikdy nevrací
-skutečná webová data.
+Měření s platným klíčem (`gemini-3.6-flash`):
 
-> Nepodařilo se ověřit živým voláním (v prostředí není API klíč a doména `ai.google.dev` je
-> blokovaná egress proxy). **Doporučuji ověřit jako první** — stačí jeden request s klíčem
-> a zapnutým logováním skutečné chyby.
+| Varianta | Výsledek |
+|---|---|
+| A: `googleSearch` + `responseMimeType` + `responseSchema` (co posílá server) | 429 `RESOURCE_EXHAUSTED` |
+| B: `googleSearch` samotný | 429 `RESOURCE_EXHAUSTED` |
+| C: `responseMimeType` + `responseSchema` samotné | 200, validní JSON pole |
 
-**Oprava:** buď zahodit `responseSchema` a parsovat JSON z volného textu, nebo rozdělit na dvě
-volání (1. grounded search → text, 2. strukturování textu do JSON bez nástroje).
+Protože 429 vrací i varianta B, kde žádné structured output není, **chyba visí na nástroji
+`googleSearch`, ne na kombinaci se schématem**. Grounding má vlastní kvótu, která je na testovaném
+klíči vyčerpaná, zatímco běžné `generateContent` na témže klíči funguje bez problémů.
+
+Zda je kombinace `googleSearch` + `responseSchema` *navíc* neplatná, se z tohoto měření zjistit
+nedá — search je kvótou zablokovaný v obou variantách, takže se k případné validační chybě
+request nedostane. K rozhodnutí je potřeba klíč s dostupnou grounding kvótou.
+
+**Praktický dopad je ale potvrzený**, a je stejný, jak nález popisoval: endpoint vždy spadne do
+lokálního fallbacku. Ověřeno end-to-end proti běžícímu serveru s platným klíčem:
+
+```
+/api/generate-questions   isOfflineFallback: False   (skutečná odpověď modelu)
+/api/search-catalog       isOfflineFallback: True    citations: 0
+                          zdroje: "PromptHero (Local)", "Awesome Prompts GitHub (Local)", ...
+```
+
+**Oprava:** nejdřív ověřit grounding kvótu na cílovém klíči. Pokud je dostupná a kombinace se
+schématem selže, rozdělit na dvě volání (1. grounded search → text, 2. strukturování textu do
+JSON bez nástroje). Nezávisle na tom je potřeba H1 — bez něj se tato chyba nikdy neprojeví.
 
 ### H3 — Smazání poslední uložené relace se neuloží
 
@@ -209,10 +245,22 @@ portem se nespustí. Použít `Number(process.env.PORT) || 3000`.
 `delete reqConfig.config.tools` maže `tools` v **původním** objektu volajícího. Odstranění
 nástroje tedy trvale přetrvá i pro další modely v seznamu kandidátů, i když to nebylo záměrem.
 
-### M3 — Dva ze tří kandidátních modelů jsou neexistující ID
-`server.ts:37-41`: `gemini-3.6-flash`, `gemini-3.1-flash-lite`. Neplatné ID vrací netranzientní
-chybu → `break` → přechod na další model. Každý request tak platí dva zbytečné round-tripy,
-než se trefí do `gemini-flash-latest`. Ověřit proti aktuálnímu seznamu modelů.
+### M3 — ~~Dva ze tří kandidátních modelů jsou neexistující ID~~ (neplatí)
+
+**Status:** **nález stažen — byl chybný.**
+
+Původní znění tvrdilo, že `gemini-3.6-flash` a `gemini-3.1-flash-lite` v `server.ts:37-41` jsou
+neexistující ID a každý request kvůli nim platí dva zbytečné round-tripy. Ověření proti
+`GET /v1beta/models` ukázalo, že **všechna tři ID existují** a vrací HTTP 200:
+
+```
+gemini-3.6-flash       -> HTTP 200
+gemini-3.1-flash-lite  -> HTTP 200
+gemini-flash-latest    -> HTTP 200
+```
+
+Seznam kandidátů je v pořádku a žádnou opravu nevyžaduje. Nález vznikl tím, že se ID
+posuzovala podle znalosti modelové řady místo dotazu na API.
 
 ### M4 — Prompt injection do systémových instrukcí
 `server.ts:100-108, 155-164, 216-232, 281-291, 330-345`. Uživatelský text se interpoluje přímo

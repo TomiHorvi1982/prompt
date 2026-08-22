@@ -456,8 +456,16 @@ async function startServer() {
     res.status(500).json({ error: "Internal server error" });
   });
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on port ${PORT}`);
+  });
+
+  // Bind failures arrive as an event, not a rejection, so without this the
+  // process-level handler below would swallow EADDRINUSE and leave a process alive
+  // that never serves anything. A server that cannot listen must exit.
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    console.error(`Server could not listen on port ${PORT}:`, err.message);
+    process.exit(1);
   });
 }
 
