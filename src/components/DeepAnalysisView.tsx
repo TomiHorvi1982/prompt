@@ -153,7 +153,7 @@ export function performDeepAnalysis(prompt: string): AnalysisData {
 
   // 2. Keyword Density Analysis
   const words = cleanPrompt
-    .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()Czech? Czechoslovakia]/g, " ")
+    .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, " ")
     .split(/\s+/);
   
   const keywordMap: { [key: string]: number } = {};

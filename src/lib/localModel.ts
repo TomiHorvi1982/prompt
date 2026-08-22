@@ -22,8 +22,11 @@ export interface SynthesizedPromptResponse {
 
 // 1. Local Question Generator
 export function localGenerateQuestions(prompt: string): Question[] {
-  const normalized = prompt.toLowerCase();
-  
+  // Coerced for the same reason as localSynthesizePrompt: a throw here escapes the
+  // endpoint's catch block and takes the process down.
+  const safePrompt = String(prompt ?? "");
+  const normalized = safePrompt.toLowerCase();
+
   let categoryTheme = "General Prompting";
   if (normalized.includes("write") || normalized.includes("text") || normalized.includes("copy")) {
     categoryTheme = "Content Creation";
@@ -39,7 +42,7 @@ export function localGenerateQuestions(prompt: string): Question[] {
     {
       id: 1,
       category: "Core Persona",
-      question: `What specific role or expert persona should the AI adopt for: "${prompt}"?`,
+      question: `What specific role or expert persona should the AI adopt for: "${safePrompt}"?`,
       placeholder: "e.g., Senior iOS Engineer, Creative Copywriter, Harvard Business Advisor"
     },
     {
@@ -180,9 +183,20 @@ export function localSynthesizePrompt(
   selectedCatalogPrompts: CatalogItem[],
   referenceAesthetics: string
 ): SynthesizedPromptResponse {
-  
-  let qSection = answers
-    .filter(a => a.answer.trim() !== "")
+
+  // This engine is the last line of defence when the Gemini call fails, so it must
+  // never throw on malformed input — a throw here escapes the endpoint's catch block.
+  const safeAnswers = (Array.isArray(answers) ? answers : [])
+    .map(a => ({
+      question: String(a?.question ?? "").trim(),
+      answer: String(a?.answer ?? "").trim()
+    }))
+    .filter(a => a.answer !== "");
+
+  const safeCatalog = (Array.isArray(selectedCatalogPrompts) ? selectedCatalogPrompts : [])
+    .map(c => String(c?.title ?? "Untitled template").trim());
+
+  let qSection = safeAnswers
     .map(a => `- **${a.question}**: ${a.answer}`)
     .join("\n");
 
@@ -190,7 +204,7 @@ export function localSynthesizePrompt(
     qSection = "- *No additional context provided*";
   }
 
-  const selectedTitles = selectedCatalogPrompts.map(c => `"${c.title}"`).join(", ") || "None selected";
+  const selectedTitles = safeCatalog.map(t => `"${t}"`).join(", ") || "None selected";
 
   const synthesized = `# ROLE & CONTEXT
 Adopt the persona of an expert in prompt engineering and optimization.
@@ -219,7 +233,7 @@ Your output should incorporate the following visual or UI aesthetic style:
 
   return {
     finalPrompt: synthesized,
-    explanation: `Successfully synthesized offline. Integrated your core prompt, ${answers.filter(a => a.answer.trim() !== "").length} context answers, and structural elements from ${selectedCatalogPrompts.length} catalog template(s): ${selectedTitles}.`
+    explanation: `Successfully synthesized offline. Integrated your core prompt, ${safeAnswers.length} context answers, and structural elements from ${safeCatalog.length} catalog template(s): ${selectedTitles}.`
   };
 }
 
