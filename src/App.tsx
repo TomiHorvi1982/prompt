@@ -234,6 +234,38 @@ export default function App() {
   // Web Speech API Voice-to-Text state
   const [isListening, setIsListening] = useState(false);
   const recognitionRef = React.useRef<any>(null);
+  // Text already in the field when dictation started; dictated speech is appended to it.
+  const dictationBaseRef = React.useRef("");
+  // Finalized speech segments accumulated across onresult events. The API only reports
+  // the newest segments from event.resultIndex on, so earlier ones must be kept here or
+  // every new phrase would replace the previous one.
+  const dictationFinalRef = React.useRef("");
+
+  // Called when the user edits the field by hand while dictation is running, so the
+  // typed text becomes the new base instead of being overwritten by the next segment.
+  const rebaseDictation = (typedValue: string) => {
+    if (!isListening) return;
+    dictationBaseRef.current = typedValue;
+    dictationFinalRef.current = "";
+  };
+
+  // Stop recognition and release the handle. Safe to call when nothing is running.
+  const stopRecognition = () => {
+    const recognition = recognitionRef.current;
+    if (!recognition) return;
+    recognition.onresult = null;
+    recognition.onerror = null;
+    recognition.onend = null;
+    try {
+      recognition.stop();
+    } catch {
+      // already stopped
+    }
+    recognitionRef.current = null;
+  };
+
+  // Recognition keeps the microphone open, so it must not outlive the component.
+  useEffect(() => stopRecognition, []);
 
   const toggleListening = () => {
     const windowObj = window as any;
@@ -245,13 +277,7 @@ export default function App() {
     }
 
     if (isListening) {
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.stop();
-        } catch {
-          // ignore
-        }
-      }
+      stopRecognition();
       setIsListening(false);
       showToast("Hlasové zadávání pozastaveno.");
       return;
@@ -263,7 +289,8 @@ export default function App() {
       recognition.interimResults = true;
       recognition.lang = navigator.language || "cs-CZ";
 
-      let baseText = originalPrompt;
+      dictationBaseRef.current = originalPrompt;
+      dictationFinalRef.current = "";
 
       recognition.onstart = () => {
         setIsListening(true);
@@ -271,14 +298,25 @@ export default function App() {
       };
 
       recognition.onresult = (event: any) => {
-        let transcript = "";
+        // Finalized segments are committed once and kept; interim ones are rebuilt on
+        // every event, since the engine keeps revising them until they are finalized.
+        let interim = "";
         for (let i = event.resultIndex; i < event.results.length; i++) {
-          transcript += event.results[i][0].transcript;
+          const result = event.results[i];
+          const text = result[0]?.transcript ?? "";
+          if (result.isFinal) {
+            dictationFinalRef.current += text;
+          } else {
+            interim += text;
+          }
         }
-        if (transcript) {
-          const spacing = baseText && !baseText.endsWith(" ") ? " " : "";
-          setOriginalPrompt(baseText + spacing + transcript);
-        }
+
+        const base = dictationBaseRef.current;
+        const spoken = dictationFinalRef.current + interim;
+        if (!spoken) return;
+
+        const spacing = base && !base.endsWith(" ") && !spoken.startsWith(" ") ? " " : "";
+        setOriginalPrompt(base + spacing + spoken);
       };
 
       recognition.onerror = (event: any) => {
@@ -293,6 +331,7 @@ export default function App() {
 
       recognition.onend = () => {
         setIsListening(false);
+        recognitionRef.current = null;
       };
 
       recognitionRef.current = recognition;
@@ -347,6 +386,13 @@ export default function App() {
     ? originalPrompt.substring(0, originalPrompt.indexOf('?'))
     : originalPrompt;
 
+  // The inline overlay mirrors the textarea character for character, so it only lines up
+  // when the completion is appended at the very end. In question mode the completion goes
+  // where the "?" is, with the marker and any trailing text still in the field, so drawing
+  // an inline ghost there would put it visibly out of place. That case gets the preview
+  // panel below the field instead.
+  const inlineGhostCompletion = ghostPrefixText === originalPrompt ? activeGhostCompletion : "";
+
   const activePredictionCategory = activeCandidate
     ? ('category' in activeCandidate ? activeCandidate.category : 'Inteligentní doplnění')
     : 'Inteligentní doplnění';
@@ -378,9 +424,15 @@ export default function App() {
     triggerICloudSync();
   };
 
+  // Word-by-word acceptance only makes sense against a completion that continues the
+  // current text. Question-mode candidates are whole canned blocks re-derived from the
+  // text before the "?", so consuming one word and re-predicting repeats that word
+  // ("… v Reactu Napiš" → "… v Reactu Napiš Napiš kompletní …"). Offered only where it works.
+  const canAcceptWordByWord = !isQuestionMode && !!activeGhostCompletion;
+
   // Apply just the next 1-2 words from active ghost completion
   const handleApplyNextWordPrediction = () => {
-    if (!activeGhostCompletion) return;
+    if (!canAcceptWordByWord) return;
 
     setPredictionUndoStack(prev => [...prev, originalPrompt]);
     setPredictionRedoStack([]);
@@ -607,7 +659,7 @@ export default function App() {
   // Capture Tab or Right Arrow to apply autocomplete, and Alt+Right to cycle variants
   const handlePromptKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Ctrl/Cmd + ArrowRight accepts +1 word from active ghost completion
-    if ((e.ctrlKey || e.metaKey) && e.key === "ArrowRight" && activeGhostCompletion) {
+    if ((e.ctrlKey || e.metaKey) && e.key === "ArrowRight" && canAcceptWordByWord) {
       e.preventDefault();
       handleApplyNextWordPrediction();
       return;
@@ -621,7 +673,10 @@ export default function App() {
     }
 
     // Right Arrow at end of text confirms ghost completion
-    if (e.key === "ArrowRight" && activeGhostCompletion) {
+    // Bare ArrowRight only. Without the modifier check this branch also swallowed
+    // Alt + ArrowRight (cycle variant) and Ctrl + ArrowRight whenever the caret sat at
+    // the end of the text, turning both into a full accept.
+    if (e.key === "ArrowRight" && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && activeGhostCompletion) {
       const target = e.currentTarget;
       if (target.selectionStart === originalPrompt.length && target.selectionEnd === originalPrompt.length) {
         e.preventDefault();
@@ -1317,7 +1372,7 @@ export default function App() {
               
               <div className="relative group">
                 {/* Google AI Studio Inline Ghost Text Overlay */}
-                {activeGhostCompletion && (
+                {inlineGhostCompletion && (
                   <div 
                     className="absolute top-0 left-0 right-0 bottom-0 p-3.5 pr-20 text-sm font-medium font-sans leading-relaxed whitespace-pre-wrap break-words pointer-events-none select-none overflow-hidden z-0"
                     aria-hidden="true"
@@ -1326,7 +1381,7 @@ export default function App() {
                     <span className="opacity-0 text-transparent select-none">{ghostPrefixText}</span>
                     {/* Ghost completion text rendered in dimmed/faded cyan style */}
                     <span className="text-cyan-400/60 font-medium italic select-none bg-cyan-950/20 px-0.5 rounded border border-cyan-800/30 animate-pulse">
-                      {activeGhostCompletion}
+                      {inlineGhostCompletion}
                     </span>
                   </div>
                 )}
@@ -1334,6 +1389,7 @@ export default function App() {
                 <textarea
                   value={originalPrompt}
                   onChange={(e) => {
+                    rebaseDictation(e.target.value);
                     setOriginalPrompt(e.target.value);
                     setActivePredictionIndex(0);
                   }}
@@ -1392,6 +1448,28 @@ export default function App() {
                 </div>
               )}
 
+              {/* Question-mode candidate preview. Stands in for the inline ghost, which
+                  cannot align when the completion is inserted at the "?" rather than appended. */}
+              {activeGhostCompletion && !inlineGhostCompletion && activeCandidate && (
+                <div className="mt-2.5 bg-slate-950/80 border border-cyan-800/40 rounded-2xl p-3 text-[11px] leading-relaxed" id="question-prediction-preview">
+                  <div className="flex items-center gap-1.5 mb-1.5 text-[9px] font-mono font-bold uppercase tracking-wider text-slate-500">
+                    <HelpCircle className="w-3 h-3 text-cyan-400" />
+                    <span>Doplnění se vloží místo otazníku</span>
+                  </div>
+                  {'title' in activeCandidate && (
+                    <div className="text-cyan-300 font-semibold font-sans mb-1">
+                      {(activeCandidate as QuestionMarkPredictionCandidate).title}
+                    </div>
+                  )}
+                  <p className="text-slate-300 font-sans">
+                    <span className="text-slate-500">{ghostPrefixText}</span>
+                    <span className="text-cyan-400/90 italic bg-cyan-950/30 px-0.5 rounded">
+                      {activeGhostCompletion}
+                    </span>
+                  </p>
+                </div>
+              )}
+
               {/* Google AI Studio Autocomplete Control Bar */}
               {activeGhostCompletion ? (
                 <div className="mt-2.5 bg-slate-950/90 border border-cyan-500/40 rounded-2xl p-3 shadow-xl backdrop-blur-md animate-in fade-in slide-in-from-top-1 duration-200" id="aistudio-ghost-bar">
@@ -1409,16 +1487,18 @@ export default function App() {
                       </button>
 
                       {/* Incremental Word-by-Word Button */}
-                      <button
-                        type="button"
-                        onClick={handleApplyNextWordPrediction}
-                        id="accept-next-word-btn"
-                        className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-cyan-500/30 text-cyan-300 font-semibold font-sans text-xs hover:border-cyan-400 active:scale-95 transition-all shadow-xs cursor-pointer"
-                        title="Vložit pouze 1-2 další slova z nápovědy (Ctrl + →)"
-                      >
-                        <span className="bg-slate-950 px-1.5 py-0.5 rounded text-[9px] font-mono text-cyan-400 border border-slate-800">Ctrl + →</span>
-                        <span>+1 Slovo po slovu</span>
-                      </button>
+                      {canAcceptWordByWord && (
+                        <button
+                          type="button"
+                          onClick={handleApplyNextWordPrediction}
+                          id="accept-next-word-btn"
+                          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-cyan-500/30 text-cyan-300 font-semibold font-sans text-xs hover:border-cyan-400 active:scale-95 transition-all shadow-xs cursor-pointer"
+                          title="Vložit pouze 1-2 další slova z nápovědy (Ctrl + →)"
+                        >
+                          <span className="bg-slate-950 px-1.5 py-0.5 rounded text-[9px] font-mono text-cyan-400 border border-slate-800">Ctrl + →</span>
+                          <span>+1 Slovo po slovu</span>
+                        </button>
+                      )}
 
                       {/* Variant Cycle Controls */}
                       {currentPredictionList.length > 1 && (
@@ -1441,7 +1521,10 @@ export default function App() {
                     <div className="flex items-center gap-2.5 text-[10px] font-mono text-slate-400 w-full sm:w-auto justify-between sm:justify-end border-t sm:border-t-0 border-slate-900 pt-2 sm:pt-0">
                       <span className="flex items-center gap-1 text-slate-400">
                         <Sparkles className="w-3 h-3 text-cyan-400" />
-                        <span>Stiskněte <strong className="text-slate-200">[Tab]</strong> pro potvrdit nebo <strong className="text-slate-200">[Ctrl + →]</strong> po slovech</span>
+                        <span>
+                          Stiskněte <strong className="text-slate-200">[Tab]</strong> pro potvrdit
+                          {canAcceptWordByWord && <> nebo <strong className="text-slate-200">[Ctrl + →]</strong> po slovech</>}
+                        </span>
                       </span>
 
                       {predictionUndoStack.length > 0 && (
